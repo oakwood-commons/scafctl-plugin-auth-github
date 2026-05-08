@@ -122,4 +122,6 @@ jobs:
 
       - name: Refresh catalog index
         run: |
+          mkdir -p ~/.docker
+          echo -n '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64)"'"}}}' > ~/.docker/config.json
           scafctl catalog index push --catalog "oci://ghcr.io/oakwood-commons"
