@@ -105,7 +105,7 @@ jobs:
 
           scafctl build plugin \
             --force \
-            --name "auth-github" \
+            --name "github" \
             --kind "auth-handler" \
             --version "${VERSION}" \
             --platform "linux/amd64=dist/${BINARY}-linux-amd64" \
@@ -115,7 +115,7 @@ jobs:
             --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe"
 
           scafctl catalog push \
-            "auth-github@${VERSION}" \
+            "github@${VERSION}" \
             --catalog "oci://ghcr.io/oakwood-commons" \
             --kind "auth-handler" \
             --force
