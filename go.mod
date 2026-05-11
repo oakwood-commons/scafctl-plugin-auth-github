@@ -1,6 +1,6 @@
 module github.com/oakwood-commons/scafctl-plugin-auth-github
 
-go 1.26.2
+go 1.26.3
 
 require (
 	github.com/go-logr/logr v1.4.3
@@ -8,7 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/oakwood-commons/httpc v0.1.0
 	github.com/oakwood-commons/oauth-helpers v0.2.0
-	github.com/oakwood-commons/scafctl-plugin-sdk v0.5.0
+	github.com/oakwood-commons/scafctl-plugin-sdk v0.5.1
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.81.0
 )
