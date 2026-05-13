@@ -70,7 +70,7 @@ jobs:
       - name: Login to GitHub Container Registry
         run: |
           mkdir -p ~/.docker
-          echo '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64)"'"}}}' > ~/.docker/config.json
+          echo '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w 0)"'"}}}' > ~/.docker/config.json
 
       - name: Download release archives
         env:
@@ -136,7 +136,7 @@ jobs:
       - name: Refresh catalog index
         run: |
           mkdir -p ~/.docker
-          echo -n '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64)"'"}}}' > ~/.docker/config.json
+          echo -n '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)"'"}}}' > ~/.docker/config.json
           scafctl catalog index push --catalog "oci://ghcr.io/oakwood-commons"
 
   sign:

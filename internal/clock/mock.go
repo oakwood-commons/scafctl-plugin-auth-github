@@ -26,7 +26,7 @@ type mockTicker struct {
 }
 
 func (m *mockTicker) C() <-chan time.Time { return m.ch }
-func (m *mockTicker) Stop()              {}
+func (m *mockTicker) Stop()               {}
 func (m *mockTicker) Reset(_ time.Duration) {
 	// Refill the buffer so subsequent reads continue to succeed.
 	now := time.Now()
