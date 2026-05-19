@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"net/url"
@@ -27,6 +28,7 @@ type TokenMetadata struct {
 	Scopes                []string     `json:"scopes,omitempty"`
 	IdentityType          string       `json:"identityType,omitempty"`
 	SessionID             string       `json:"sessionId,omitempty"`
+	Flow                  auth.Flow    `json:"flow,omitempty"`
 }
 
 // TokenResponse represents the response from the GitHub OAuth token endpoint.
@@ -73,6 +75,10 @@ func (p *Plugin) refreshAccessToken(ctx context.Context, refreshToken, clientID 
 	lgr := logr.FromContextOrDiscard(ctx)
 	endpoint := fmt.Sprintf("%s/login/oauth/access_token", p.config.GetOAuthBaseURL())
 
+	// Load metadata once; used for token rotation and to propagate Flow/SessionID
+	// onto the returned token. Best-effort: nil on failure.
+	metadata, metaErr := p.loadMetadata(ctx)
+
 	data := makeFormData(map[string]string{
 		"client_id":     clientID,
 		"grant_type":    "refresh_token",
@@ -98,20 +104,38 @@ func (p *Plugin) refreshAccessToken(ctx context.Context, refreshToken, clientID 
 	// If we got a new refresh token, update stored credentials
 	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
 		lgr.V(1).Info("refresh token rotated, storing new token")
-		metadata, metaErr := p.loadMetadata(ctx)
 		if metaErr != nil {
 			lgr.V(1).Info("failed to load metadata during token rotation, skipping credential update", "error", metaErr)
 		} else {
 			var scopes []string
 			var sessionID string
+			var originalFlow auth.Flow
 			if metadata != nil {
 				scopes = metadata.Scopes
 				sessionID = metadata.SessionID
+				originalFlow = metadata.Flow
 			}
-			if _, err := p.storeCredentials(ctx, &tokenResp, scopes, sessionID); err != nil {
+			if _, err := p.storeCredentials(ctx, &tokenResp, scopes, sessionID, originalFlow); err != nil {
 				lgr.V(1).Info("warning: failed to update refresh token", "error", err)
 			}
 		}
+	}
+
+	// Propagate flow, sessionID, and scopes from stored metadata so that the
+	// token cached by GetToken reflects the original login context rather than
+	// hard-coding FlowDeviceCode for all flows.
+	var flow auth.Flow
+	var sessionID string
+	var scopes []string
+	if metadata != nil {
+		flow = metadata.Flow
+		sessionID = metadata.SessionID
+		scopes = metadata.Scopes
+	}
+
+	scope := tokenResp.Scope
+	if scope == "" {
+		scope = strings.Join(scopes, " ")
 	}
 
 	expiresAt := time.Now().Add(8 * time.Hour)
@@ -123,13 +147,14 @@ func (p *Plugin) refreshAccessToken(ctx context.Context, refreshToken, clientID 
 		AccessToken: tokenResp.AccessToken,
 		TokenType:   tokenResp.TokenType,
 		ExpiresAt:   expiresAt,
-		Scope:       tokenResp.Scope,
-		Flow:        auth.FlowDeviceCode,
+		Scope:       scope,
+		Flow:        flow,
+		SessionID:   sessionID,
 	}, nil
 }
 
 // storeCredentials securely stores the refresh token (or access token) and metadata.
-func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse, scopes []string, sessionID string) (*auth.Claims, error) {
+func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse, scopes []string, sessionID string, flow auth.Flow) (*auth.Claims, error) {
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return nil, fmt.Errorf("host service not available")
@@ -172,6 +197,7 @@ func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse,
 		Scopes:                scopes,
 		IdentityType:          string(auth.IdentityTypeUser),
 		SessionID:             sessionID,
+		Flow:                  flow,
 	}
 
 	metadataBytes, err := json.Marshal(metadata)
@@ -181,6 +207,41 @@ func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse,
 
 	if err := hostClient.SetSecret(ctx, SecretKeyMetadata, string(metadataBytes)); err != nil {
 		return nil, fmt.Errorf("failed to store metadata: %w", err)
+	}
+
+	// Cache the access token so ListCachedTokens can report it with full
+	// metadata (ExpiresAt, Flow, etc.) immediately after login without
+	// requiring a separate GetToken call.
+	if tokenResp.AccessToken != "" {
+		lgr := logr.FromContextOrDiscard(ctx)
+		var expiresAt time.Time
+		if tokenResp.ExpiresIn > 0 {
+			expiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+		} else if tokenResp.RefreshToken != "" {
+			// Device-code tokens without an explicit expiry are still short-lived;
+			// use the same 8h fallback as refreshAccessToken.
+			expiresAt = time.Now().Add(8 * time.Hour)
+		} else {
+			expiresAt = farFuture() // truly non-expiring OAuth App token
+		}
+		cacheScope := tokenResp.Scope
+		if cacheScope == "" {
+			cacheScope = strings.Join(scopes, " ")
+		}
+		fp := fingerprintHash(p.config.Hostname)
+		cacheKey := fp + ":" + defaultCacheKey
+		cacheToken := &auth.Token{
+			AccessToken: tokenResp.AccessToken,
+			TokenType:   tokenResp.TokenType,
+			ExpiresAt:   expiresAt,
+			Scope:       cacheScope,
+			Flow:        flow,
+			SessionID:   sessionID,
+		}
+		// Best-effort: don't fail login if caching fails.
+		if err := cacheSet(ctx, hostClient, cacheKey, cacheToken); err != nil {
+			lgr.V(1).Info("failed to cache token after login", "error", err)
+		}
 	}
 
 	return claims, nil

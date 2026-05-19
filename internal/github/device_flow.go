@@ -14,6 +14,7 @@ import (
 	"github.com/go-logr/logr"
 	oauth "github.com/oakwood-commons/oauth-helpers"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
+	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 )
 
 // DeviceCodeResponse represents the response from GitHub's device code endpoint.
@@ -113,7 +114,7 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, scopes []string, ope
 		return nil, fmt.Errorf("github: token_poll: %w", err)
 	}
 
-	claims, err := p.storeCredentials(ctx, tokenResp, scopes, "")
+	claims, err := p.storeCredentials(ctx, tokenResp, scopes, "", auth.FlowDeviceCode)
 	if err != nil {
 		return nil, fmt.Errorf("github: store_credentials: %w", err)
 	}
