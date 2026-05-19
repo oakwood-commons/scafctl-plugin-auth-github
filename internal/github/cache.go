@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -108,12 +107,11 @@ func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClie
 			continue
 		}
 
-		scope := strings.TrimPrefix(key, SecretKeyTokenPrefix)
 		results = append(results, &auth.CachedTokenInfo{
 			Handler:   HandlerName,
 			TokenKind: "access",
 			TokenType: entry.TokenType,
-			Scope:     scope,
+			Scope:     entry.Scope,
 			Flow:      entry.Flow,
 			ExpiresAt: entry.ExpiresAt,
 			CachedAt:  entry.CachedAt,

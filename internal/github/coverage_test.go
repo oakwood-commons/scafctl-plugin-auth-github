@@ -120,7 +120,7 @@ func TestStoreAndLoadCredentials(t *testing.T) {
 	p := newTestPluginWithHost(mock, fake)
 	ctx := context.Background()
 	tokenResp := &TokenResponse{AccessToken: "at_123", RefreshToken: "rt_456", TokenType: "bearer", Scope: "repo", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400}
-	claims, err := p.storeCredentials(ctx, tokenResp, []string{"repo"}, "sess-abc")
+	claims, err := p.storeCredentials(ctx, tokenResp, []string{"repo"}, "sess-abc", auth.FlowDeviceCode)
 	require.NoError(t, err)
 	assert.Equal(t, "octocat", claims.Subject)
 	rt, err := p.loadRefreshToken(ctx)
@@ -133,6 +133,98 @@ func TestStoreAndLoadCredentials(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "octocat", meta.Claims.Subject)
 	assert.Equal(t, "sess-abc", meta.SessionID)
+}
+
+func TestStoreCredentials_CachesTokenMetadata(t *testing.T) {
+	tests := []struct {
+		name             string
+		tokenResp        *TokenResponse
+		flow             auth.Flow
+		wantFlow         auth.Flow
+		wantScope        string
+		wantExpiryApprox time.Duration // expected expiry relative to now (approximate)
+		wantExpiryFar    bool          // true when we expect a far-future expiry
+	}{
+		{
+			name:             "device-code with explicit ExpiresIn",
+			tokenResp:        &TokenResponse{AccessToken: "at", RefreshToken: "rt", TokenType: "bearer", Scope: "repo", ExpiresIn: 3600},
+			flow:             auth.FlowDeviceCode,
+			wantFlow:         auth.FlowDeviceCode,
+			wantScope:        "repo",
+			wantExpiryApprox: time.Hour,
+		},
+		{
+			name:             "device-code without ExpiresIn falls back to 8h",
+			tokenResp:        &TokenResponse{AccessToken: "at", RefreshToken: "rt", TokenType: "bearer", Scope: "repo"},
+			flow:             auth.FlowDeviceCode,
+			wantFlow:         auth.FlowDeviceCode,
+			wantScope:        "repo",
+			wantExpiryApprox: 8 * time.Hour,
+		},
+		{
+			name:          "non-expiring OAuth App token uses far-future",
+			tokenResp:     &TokenResponse{AccessToken: "at", TokenType: "bearer", Scope: "repo"},
+			flow:          "",
+			wantFlow:      "",
+			wantScope:     "repo",
+			wantExpiryFar: true,
+		},
+		{
+			name:             "interactive flow labeled correctly",
+			tokenResp:        &TokenResponse{AccessToken: "at", RefreshToken: "rt", TokenType: "bearer", Scope: "user:email", ExpiresIn: 28800},
+			flow:             auth.FlowInteractive,
+			wantFlow:         auth.FlowInteractive,
+			wantScope:        "user:email",
+			wantExpiryApprox: 8 * time.Hour,
+		},
+		{
+			name:          "empty response scope falls back to requested scopes",
+			tokenResp:     &TokenResponse{AccessToken: "at", TokenType: "bearer"},
+			flow:          auth.FlowDeviceCode,
+			wantFlow:      auth.FlowDeviceCode,
+			wantScope:     "repo read:org",
+			wantExpiryFar: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := NewMockHTTPClient()
+			mock.AddResponse(200, User{Login: "octocat", ID: 1, Name: "Octocat"})
+			fake := newFakeHostService()
+			p := newTestPluginWithHost(mock, fake)
+			hc := newFakeHostClient(fake)
+			ctx := context.Background()
+
+			var requestedScopes []string
+			if tc.wantScope == "repo read:org" {
+				requestedScopes = []string{"repo", "read:org"}
+			} else {
+				requestedScopes = []string{"repo"}
+			}
+
+			before := time.Now()
+			_, err := p.storeCredentials(ctx, tc.tokenResp, requestedScopes, "sess-xyz", tc.flow)
+			require.NoError(t, err)
+
+			fp := fingerprintHash(p.config.Hostname)
+			cached, err := cacheGet(ctx, hc, fp+":"+defaultCacheKey)
+			require.NoError(t, err)
+			require.NotNil(t, cached, "expected a cache entry to be created")
+
+			assert.Equal(t, tc.tokenResp.AccessToken, cached.AccessToken)
+			assert.Equal(t, tc.wantScope, cached.Scope)
+			assert.Equal(t, tc.wantFlow, cached.Flow)
+			assert.Equal(t, "sess-xyz", cached.SessionID)
+
+			if tc.wantExpiryFar {
+				assert.True(t, cached.ExpiresAt.After(time.Now().Add(364*24*time.Hour)), "expected far-future expiry")
+			} else {
+				assert.True(t, cached.ExpiresAt.After(before.Add(tc.wantExpiryApprox-5*time.Second)), "expiry too early")
+				assert.True(t, cached.ExpiresAt.Before(before.Add(tc.wantExpiryApprox+5*time.Second)), "expiry too late")
+			}
+		})
+	}
 }
 
 func TestLoadMetadataCorrupt(t *testing.T) {
@@ -152,6 +244,55 @@ func TestRefreshAccessToken_Success(t *testing.T) {
 	tok, err := p.refreshAccessToken(context.Background(), "old_rt", "cid")
 	require.NoError(t, err)
 	assert.Equal(t, "new_at", tok.AccessToken)
+}
+
+func TestRefreshAccessToken_PropagatesMetadata(t *testing.T) {
+	tests := []struct {
+		name          string
+		tokenScope    string
+		wantScope     string
+		wantFlow      auth.Flow
+		wantSessionID string
+	}{
+		{
+			name:          "propagates flow and sessionID from stored metadata",
+			tokenScope:    "repo",
+			wantScope:     "repo",
+			wantFlow:      auth.FlowInteractive,
+			wantSessionID: "sess-999",
+		},
+		{
+			name:          "scope fallback when response omits scope",
+			tokenScope:    "",
+			wantScope:     "repo read:org",
+			wantFlow:      auth.FlowInteractive,
+			wantSessionID: "sess-999",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := NewMockHTTPClient()
+			mock.AddResponse(200, TokenResponse{AccessToken: "new_at", TokenType: "bearer", Scope: tc.tokenScope, ExpiresIn: 3600})
+			fake := newFakeHostService()
+			p := newTestPluginWithHost(mock, fake)
+			hc := newFakeHostClient(fake)
+			ctx := context.Background()
+			meta := &TokenMetadata{
+				Claims:    &auth.Claims{Subject: "u"},
+				Scopes:    []string{"repo", "read:org"},
+				SessionID: "sess-999",
+				Flow:      auth.FlowInteractive,
+			}
+			mb, _ := json.Marshal(meta)
+			require.NoError(t, hc.SetSecret(ctx, SecretKeyMetadata, string(mb)))
+			tok, err := p.refreshAccessToken(ctx, "old_rt", "cid")
+			require.NoError(t, err)
+			assert.Equal(t, "new_at", tok.AccessToken)
+			assert.Equal(t, tc.wantScope, tok.Scope)
+			assert.Equal(t, tc.wantFlow, tok.Flow)
+			assert.Equal(t, tc.wantSessionID, tok.SessionID)
+		})
+	}
 }
 
 func TestRefreshAccessToken_EmptyToken(t *testing.T) {

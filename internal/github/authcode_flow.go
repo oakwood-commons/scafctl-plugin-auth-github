@@ -14,6 +14,7 @@ import (
 	"github.com/go-logr/logr"
 	oauth "github.com/oakwood-commons/oauth-helpers"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
+	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 )
 
 // authCodeLogin performs the OAuth 2.0 authorization code + PKCE flow.
@@ -106,7 +107,7 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 		return nil, fmt.Errorf("github: token_exchange: %w", err)
 	}
 
-	claims, err := p.storeCredentials(ctx, tokenResp, scopes, "")
+	claims, err := p.storeCredentials(ctx, tokenResp, scopes, "", auth.FlowInteractive)
 	if err != nil {
 		return nil, fmt.Errorf("github: store_credentials: %w", err)
 	}
