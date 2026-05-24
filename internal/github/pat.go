@@ -97,6 +97,7 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 	}
 
 	hostClient := p.hostClient(ctx)
+	profile := auth.ProfileFromContext(ctx)
 
 	// Use hostname-based cache key to avoid passing the raw token through
 	// more code paths than necessary.
@@ -105,7 +106,7 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 
 	// Check cache unless force refresh
 	if !req.ForceRefresh && hostClient != nil {
-		cached, err := cacheGet(ctx, hostClient, cacheKey)
+		cached, err := cacheGet(ctx, hostClient, cacheKey, profile)
 		if err == nil && cached != nil {
 			minValidFor := req.MinValidFor
 			if minValidFor == 0 {
@@ -145,7 +146,7 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 			ExpiresAt:   result.ExpiresAt,
 			Flow:        auth.FlowPAT,
 		}
-		if cacheErr := cacheSet(ctx, hostClient, cacheKey, cacheToken); cacheErr != nil {
+		if cacheErr := cacheSet(ctx, hostClient, cacheKey, cacheToken, profile); cacheErr != nil {
 			lgr := logr.FromContextOrDiscard(ctx)
 			lgr.V(1).Info("failed to cache PAT token", "error", cacheErr)
 		}

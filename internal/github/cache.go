@@ -28,8 +28,12 @@ type tokenCacheEntry struct {
 }
 
 // cacheGet retrieves a cached token from the host secret store.
-func cacheGet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cacheKey string) (*auth.Token, error) {
-	fullKey := SecretKeyTokenPrefix + cacheKey
+func cacheGet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cacheKey, profile string) (*auth.Token, error) {
+	prefix, err := profileTokenPrefix(profile)
+	if err != nil {
+		return nil, err
+	}
+	fullKey := prefix + cacheKey
 	value, found, err := hostClient.GetSecret(ctx, fullKey)
 	if err != nil {
 		return nil, err
@@ -55,7 +59,7 @@ func cacheGet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cach
 }
 
 // cacheSet stores a token in the host secret store cache.
-func cacheSet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cacheKey string, token *auth.Token) error {
+func cacheSet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cacheKey string, token *auth.Token, profile string) error {
 	entry := tokenCacheEntry{
 		AccessToken: token.AccessToken,
 		TokenType:   token.TokenType,
@@ -71,12 +75,21 @@ func cacheSet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cach
 		return fmt.Errorf("failed to marshal token for caching: %w", err)
 	}
 
-	return hostClient.SetSecret(ctx, SecretKeyTokenPrefix+cacheKey, string(data))
+	prefix, err := profileTokenPrefix(profile)
+	if err != nil {
+		return err
+	}
+	return hostClient.SetSecret(ctx, prefix+cacheKey, string(data))
 }
 
 // cacheClear removes all cached tokens from the host secret store.
-func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient) {
-	keys, err := hostClient.ListSecrets(ctx, SecretKeyTokenPrefix+"*")
+func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient, profile string) {
+	prefix, err := profileTokenPrefix(profile)
+	if err != nil {
+		lgr.V(1).Info("invalid profile for cache clear", "error", err)
+		return
+	}
+	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
 		lgr.V(1).Info("failed to list cached tokens", "error", err)
 		return
@@ -89,8 +102,12 @@ func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.Host
 }
 
 // cacheListEntries lists all cached token entries.
-func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClient) ([]*auth.CachedTokenInfo, error) {
-	keys, err := hostClient.ListSecrets(ctx, SecretKeyTokenPrefix+"*")
+func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClient, profile string) ([]*auth.CachedTokenInfo, error) {
+	prefix, err := profileTokenPrefix(profile)
+	if err != nil {
+		return nil, err
+	}
+	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +141,12 @@ func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClie
 }
 
 // cachePurgeExpired removes expired tokens and returns the count removed.
-func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceClient) (int, error) {
-	keys, err := hostClient.ListSecrets(ctx, SecretKeyTokenPrefix+"*")
+func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceClient, profile string) (int, error) {
+	prefix, err := profileTokenPrefix(profile)
+	if err != nil {
+		return 0, err
+	}
+	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
 		return 0, err
 	}

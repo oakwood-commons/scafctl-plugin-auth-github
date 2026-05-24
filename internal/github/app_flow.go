@@ -101,6 +101,10 @@ func (p *Plugin) appLogin(ctx context.Context) (*sdkplugin.LoginResponse, error)
 	)
 
 	// Cache the token
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return nil, err
+	}
 	token := &auth.Token{
 		AccessToken: installToken.Token,
 		TokenType:   "Bearer",
@@ -110,14 +114,15 @@ func (p *Plugin) appLogin(ctx context.Context) (*sdkplugin.LoginResponse, error)
 	if hostClient != nil {
 		appFingerprint := fingerprintHash(fmt.Sprintf("%d:%d", appID, installationID))
 		cacheKey := appFingerprint + ":" + installationTokenCacheKey
-		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token); cacheErr != nil {
+		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
 			lgr.V(1).Info("failed to cache installation token", "error", cacheErr)
 		}
 	}
 
 	// Store as primary access token
 	if hostClient != nil {
-		if err := hostClient.SetSecret(ctx, SecretKeyAccessToken, installToken.Token); err != nil {
+		accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
+		if err := hostClient.SetSecret(ctx, accessKey, installToken.Token); err != nil {
 			return nil, fmt.Errorf("github: store_token: failed to store installation token: %w", err)
 		}
 	}
@@ -144,7 +149,8 @@ func (p *Plugin) appLogin(ctx context.Context) (*sdkplugin.LoginResponse, error)
 		return nil, fmt.Errorf("github: store_metadata: failed to marshal metadata: %w", err)
 	}
 	if hostClient != nil {
-		if err := hostClient.SetSecret(ctx, SecretKeyMetadata, string(metadataBytes)); err != nil {
+		metaKey, _ := profileSecretKey(SecretKeyMetadata, profile)
+		if err := hostClient.SetSecret(ctx, metaKey, string(metadataBytes)); err != nil {
 			return nil, fmt.Errorf("github: store_metadata: failed to store metadata: %w", err)
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -45,7 +46,46 @@ const (
 
 	// defaultCacheKey is the fixed cache key for GitHub tokens.
 	defaultCacheKey = "_github"
+
+	// secretKeyBase is the common prefix for all GitHub auth secret keys.
+	secretKeyBase = "scafctl.auth.github."
 )
+
+// errInvalidProfile is returned when a profile name contains characters that
+// would collide with the secret-key namespace structure.
+var errInvalidProfile = fmt.Errorf("profile name must not contain '.', '/', '\\', or ':'")
+
+// validateProfile checks that the profile name is safe for use in secret-key
+// namespacing. An empty profile (the default) is always valid.
+func validateProfile(profile string) error {
+	if profile != "" && strings.ContainsAny(profile, "./\\:") {
+		return errInvalidProfile
+	}
+	return nil
+}
+
+// profileSecretKey returns the secret key namespaced by profile.
+// For the default (empty) profile, the key is unchanged for backward compatibility.
+func profileSecretKey(key, profile string) (string, error) {
+	if err := validateProfile(profile); err != nil {
+		return "", err
+	}
+	if profile == "" {
+		return key, nil
+	}
+	return secretKeyBase + profile + "." + strings.TrimPrefix(key, secretKeyBase), nil
+}
+
+// profileTokenPrefix returns the token cache prefix namespaced by profile.
+func profileTokenPrefix(profile string) (string, error) {
+	if err := validateProfile(profile); err != nil {
+		return "", err
+	}
+	if profile == "" {
+		return SecretKeyTokenPrefix, nil
+	}
+	return secretKeyBase + profile + ".token.", nil
+}
 
 // BrowserOpenFunc is the signature for a function that opens a URL in the browser.
 type BrowserOpenFunc func(ctx context.Context, url string) error
@@ -180,21 +220,29 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 		return fmt.Errorf("host service not available")
 	}
 
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return err
+	}
+
 	// Clear all cached tokens
-	cacheClear(ctx, lgr, hostClient)
+	cacheClear(ctx, lgr, hostClient, profile)
 
 	// Delete refresh token
-	if err := hostClient.DeleteSecret(ctx, SecretKeyRefreshToken); err != nil {
+	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
+	if err := hostClient.DeleteSecret(ctx, refreshKey); err != nil {
 		lgr.V(1).Info("failed to delete refresh token (may not exist)", "error", err)
 	}
 
 	// Delete access token
-	if err := hostClient.DeleteSecret(ctx, SecretKeyAccessToken); err != nil {
+	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
+	if err := hostClient.DeleteSecret(ctx, accessKey); err != nil {
 		lgr.V(1).Info("failed to delete access token (may not exist)", "error", err)
 	}
 
 	// Delete metadata
-	if err := hostClient.DeleteSecret(ctx, SecretKeyMetadata); err != nil {
+	metaKey, _ := profileSecretKey(SecretKeyMetadata, profile)
+	if err := hostClient.DeleteSecret(ctx, metaKey); err != nil {
 		lgr.V(1).Info("failed to delete metadata (may not exist)", "error", err)
 	}
 
@@ -207,14 +255,21 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string) (*auth.Statu
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
 
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return nil, err
+	}
+
 	// Check for PAT credentials first (highest priority)
 	if HasPATCredentials() {
 		return p.patStatus(ctx)
 	}
 
 	// Check if we have stored credentials
-	hasRefresh := p.secretExists(ctx, SecretKeyRefreshToken)
-	hasAccess := p.secretExists(ctx, SecretKeyAccessToken)
+	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
+	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
+	hasRefresh := p.secretExists(ctx, refreshKey)
+	hasAccess := p.secretExists(ctx, accessKey)
 
 	if !hasRefresh && !hasAccess {
 		return &auth.Status{Authenticated: false}, nil
@@ -254,6 +309,11 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 
 	lgr := logr.FromContextOrDiscard(ctx)
 
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return nil, err
+	}
+
 	// Use PAT flow if credentials are present (highest priority)
 	if HasPATCredentials() {
 		return p.getPATToken(ctx, req)
@@ -276,7 +336,7 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 
 	// Check cache first (unless force refresh)
 	if !req.ForceRefresh && hostClient != nil {
-		token, err := cacheGet(ctx, hostClient, cacheKey)
+		token, err := cacheGet(ctx, hostClient, cacheKey, profile)
 		if err == nil && token != nil && token.IsValidFor(minValidFor) {
 			lgr.V(1).Info("using cached token",
 				"expiresAt", token.ExpiresAt,
@@ -311,7 +371,7 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 			ExpiresAt:   farFuture(),
 		}
 		if hostClient != nil {
-			if cacheErr := cacheSet(ctx, hostClient, cacheKey, token); cacheErr != nil {
+			if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
 				lgr.V(1).Info("failed to cache token", "error", cacheErr)
 			}
 		}
@@ -330,7 +390,7 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 
 	// Cache the token
 	if hostClient != nil {
-		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token); cacheErr != nil {
+		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
 			lgr.V(1).Info("failed to cache token", "error", cacheErr)
 		}
 	}
@@ -358,8 +418,14 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 
 	var results []*auth.CachedTokenInfo
 
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return nil, err
+	}
+
 	// Refresh token (device code flow with token expiry enabled)
-	if p.secretExists(ctx, SecretKeyRefreshToken) {
+	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
+	if p.secretExists(ctx, refreshKey) {
 		info := &auth.CachedTokenInfo{
 			Handler:   HandlerName,
 			TokenKind: "refresh",
@@ -369,6 +435,9 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 			info.ExpiresAt = metadata.RefreshTokenExpiresAt
 			info.CachedAt = metadata.LastRefresh
 			info.SessionID = metadata.SessionID
+			if metadata.Flow != "" {
+				info.Flow = metadata.Flow
+			}
 		}
 		if !info.ExpiresAt.IsZero() {
 			info.IsExpired = time.Now().After(info.ExpiresAt)
@@ -377,14 +446,15 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 	}
 
 	// Minted access tokens from cache
-	entries, _ := cacheListEntries(ctx, hostClient)
+	entries, _ := cacheListEntries(ctx, hostClient, profile)
 	results = append(results, entries...)
 
 	// Direct access token not in cache
-	if p.secretExists(ctx, SecretKeyAccessToken) {
+	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
+	if p.secretExists(ctx, accessKey) {
 		fp := fingerprintHash(p.config.Hostname)
 		cacheKey := fp + ":" + defaultCacheKey
-		cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
+		cached, cacheErr := cacheGet(ctx, hostClient, cacheKey, profile)
 		if cacheErr != nil || cached == nil {
 			info := &auth.CachedTokenInfo{
 				Handler:   HandlerName,
@@ -394,6 +464,7 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 			if metadata, err := p.loadMetadata(ctx); err == nil && metadata != nil {
 				info.CachedAt = metadata.LastRefresh
 				info.SessionID = metadata.SessionID
+				info.Flow = metadata.Flow
 			}
 			results = append(results, info)
 		}
@@ -413,7 +484,12 @@ func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (in
 		return 0, nil
 	}
 
-	return cachePurgeExpired(ctx, hostClient)
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return 0, err
+	}
+
+	return cachePurgeExpired(ctx, hostClient, profile)
 }
 
 // DetectAvailableFlows reports which auth flows are available based on

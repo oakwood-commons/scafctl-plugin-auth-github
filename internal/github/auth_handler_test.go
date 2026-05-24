@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
@@ -509,4 +510,255 @@ func TestTokenMigration_MetadataDeserialization(t *testing.T) {
 	assert.Equal(t, []string{"repo", "read:org"}, metadata.Scopes)
 	assert.Equal(t, "user", metadata.IdentityType)
 	assert.Equal(t, "abc123", metadata.SessionID)
+}
+
+func TestProfileSecretKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		profile string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "default profile unchanged",
+			key:     SecretKeyRefreshToken,
+			profile: "",
+			want:    "scafctl.auth.github.refresh_token",
+		},
+		{
+			name:    "named profile namespaced",
+			key:     SecretKeyRefreshToken,
+			profile: "work",
+			want:    "scafctl.auth.github.work.refresh_token",
+		},
+		{
+			name:    "access token namespaced",
+			key:     SecretKeyAccessToken,
+			profile: "personal",
+			want:    "scafctl.auth.github.personal.access_token",
+		},
+		{
+			name:    "metadata namespaced",
+			key:     SecretKeyMetadata,
+			profile: "corp",
+			want:    "scafctl.auth.github.corp.metadata",
+		},
+		{
+			name:    "profile with dot is rejected",
+			key:     SecretKeyRefreshToken,
+			profile: "a.b",
+			wantErr: true,
+		},
+		{
+			name:    "profile with slash is rejected",
+			key:     SecretKeyAccessToken,
+			profile: "a/b",
+			wantErr: true,
+		},
+		{
+			name:    "profile with colon is rejected",
+			key:     SecretKeyMetadata,
+			profile: "a:b",
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := profileSecretKey(tc.key, tc.profile)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestProfileTokenPrefix(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "default profile",
+			profile: "",
+			want:    SecretKeyTokenPrefix,
+		},
+		{
+			name:    "named profile",
+			profile: "work",
+			want:    "scafctl.auth.github.work.token.",
+		},
+		{
+			name:    "invalid profile is rejected",
+			profile: "a.b",
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := profileTokenPrefix(tc.profile)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestProfileIsolation_StoreAndLoad(t *testing.T) {
+	mock := NewMockHTTPClient()
+	// Two responses for two storeCredentials calls (each fetches user claims).
+	mock.AddResponse(200, User{Login: "default-user", ID: 1, Name: "Default"})
+	mock.AddResponse(200, User{Login: "work-user", ID: 2, Name: "Work"})
+
+	fake := newFakeHostService()
+	p := newTestPluginWithHost(mock, fake)
+
+	defaultCtx := context.Background()
+	workCtx := auth.WithProfile(context.Background(), "work")
+
+	// Store credentials under default profile.
+	defaultResp := &TokenResponse{AccessToken: "at_default", RefreshToken: "rt_default", TokenType: "bearer", Scope: "repo", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400}
+	claims, err := p.storeCredentials(defaultCtx, defaultResp, []string{"repo"}, "sess-default", auth.FlowDeviceCode)
+	require.NoError(t, err)
+	assert.Equal(t, "default-user", claims.Subject)
+
+	// Store credentials under "work" profile.
+	workResp := &TokenResponse{AccessToken: "at_work", RefreshToken: "rt_work", TokenType: "bearer", Scope: "repo read:org", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400}
+	claims, err = p.storeCredentials(workCtx, workResp, []string{"repo", "read:org"}, "sess-work", auth.FlowDeviceCode)
+	require.NoError(t, err)
+	assert.Equal(t, "work-user", claims.Subject)
+
+	// Load from default profile.
+	rt, err := p.loadRefreshToken(defaultCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "rt_default", rt)
+
+	at, err := p.loadAccessToken(defaultCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "at_default", at)
+
+	meta, err := p.loadMetadata(defaultCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "default-user", meta.Claims.Subject)
+
+	// Load from work profile — must be isolated.
+	rt, err = p.loadRefreshToken(workCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "rt_work", rt)
+
+	at, err = p.loadAccessToken(workCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "at_work", at)
+
+	meta, err = p.loadMetadata(workCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "work-user", meta.Claims.Subject)
+}
+
+func TestProfileIsolation_LogoutOnlyAffectsProfile(t *testing.T) {
+	mock := NewMockHTTPClient()
+	mock.AddResponse(200, User{Login: "default-user", ID: 1, Name: "Default"})
+	mock.AddResponse(200, User{Login: "work-user", ID: 2, Name: "Work"})
+
+	fake := newFakeHostService()
+	p := newTestPluginWithHost(mock, fake)
+
+	defaultCtx := context.Background()
+	workCtx := auth.WithProfile(context.Background(), "work")
+
+	// Store credentials in both profiles.
+	defaultResp := &TokenResponse{AccessToken: "at_default", RefreshToken: "rt_default", TokenType: "bearer", Scope: "repo", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400}
+	_, err := p.storeCredentials(defaultCtx, defaultResp, []string{"repo"}, "sess-default", auth.FlowDeviceCode)
+	require.NoError(t, err)
+
+	workResp := &TokenResponse{AccessToken: "at_work", RefreshToken: "rt_work", TokenType: "bearer", Scope: "repo", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400}
+	_, err = p.storeCredentials(workCtx, workResp, []string{"repo"}, "sess-work", auth.FlowDeviceCode)
+	require.NoError(t, err)
+
+	// Logout work profile.
+	err = p.Logout(workCtx, HandlerName)
+	require.NoError(t, err)
+
+	// Work profile tokens are gone.
+	_, err = p.loadRefreshToken(workCtx)
+	assert.Error(t, err)
+
+	// Default profile tokens are still present.
+	rt, err := p.loadRefreshToken(defaultCtx)
+	require.NoError(t, err)
+	assert.Equal(t, "rt_default", rt)
+}
+
+func TestProfileIsolation_CacheIsolated(t *testing.T) {
+	fake := newFakeHostService()
+	hc := newFakeHostClient(fake)
+	ctx := context.Background()
+
+	tok1 := &auth.Token{AccessToken: "default_tok", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour)}
+	tok2 := &auth.Token{AccessToken: "work_tok", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour)}
+
+	// Store tokens in different profile namespaces.
+	require.NoError(t, cacheSet(ctx, hc, "key1", tok1, ""))
+	require.NoError(t, cacheSet(ctx, hc, "key1", tok2, "work"))
+
+	// Retrieve each — they should be different.
+	got1, err := cacheGet(ctx, hc, "key1", "")
+	require.NoError(t, err)
+	require.NotNil(t, got1)
+	assert.Equal(t, "default_tok", got1.AccessToken)
+
+	got2, err := cacheGet(ctx, hc, "key1", "work")
+	require.NoError(t, err)
+	require.NotNil(t, got2)
+	assert.Equal(t, "work_tok", got2.AccessToken)
+
+	// Clear only the work profile cache.
+	cacheClear(ctx, discardLogger(), hc, "work")
+
+	// Default still exists.
+	got1, err = cacheGet(ctx, hc, "key1", "")
+	require.NoError(t, err)
+	assert.NotNil(t, got1)
+
+	// Work is gone.
+	got2, err = cacheGet(ctx, hc, "key1", "work")
+	require.NoError(t, err)
+	assert.Nil(t, got2)
+}
+
+func TestProfileIsolation_GetStatus(t *testing.T) {
+	mock := NewMockHTTPClient()
+	mock.AddResponse(200, User{Login: "default-user", ID: 1, Name: "Default"})
+
+	fake := newFakeHostService()
+	p := newTestPluginWithHost(mock, fake)
+
+	defaultCtx := context.Background()
+	workCtx := auth.WithProfile(context.Background(), "work")
+
+	t.Setenv(EnvGitHubToken, "")
+	t.Setenv(EnvGHToken, "")
+
+	// Store credentials in default profile only.
+	resp := &TokenResponse{AccessToken: "at_default", RefreshToken: "rt_default", TokenType: "bearer", Scope: "repo", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400}
+	_, err := p.storeCredentials(defaultCtx, resp, []string{"repo"}, "sess", auth.FlowDeviceCode)
+	require.NoError(t, err)
+
+	// Default profile: authenticated.
+	status, err := p.GetStatus(defaultCtx, HandlerName)
+	require.NoError(t, err)
+	assert.True(t, status.Authenticated)
+
+	// Work profile: not authenticated.
+	status, err = p.GetStatus(workCtx, HandlerName)
+	require.NoError(t, err)
+	assert.False(t, status.Authenticated)
 }

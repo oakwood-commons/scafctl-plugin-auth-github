@@ -60,21 +60,21 @@ func TestCacheGetSetPurge(t *testing.T) {
 	fake := newFakeHostService()
 	hc := newFakeHostClient(fake)
 	ctx := context.Background()
-	token, err := cacheGet(ctx, hc, "testkey")
+	token, err := cacheGet(ctx, hc, "testkey", "")
 	require.NoError(t, err)
 	assert.Nil(t, token)
 	tok := &auth.Token{AccessToken: "abc", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour), Scope: "repo", Flow: auth.FlowDeviceCode, SessionID: "sess1"}
-	require.NoError(t, cacheSet(ctx, hc, "testkey", tok))
-	got, err := cacheGet(ctx, hc, "testkey")
+	require.NoError(t, cacheSet(ctx, hc, "testkey", tok, ""))
+	got, err := cacheGet(ctx, hc, "testkey", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "abc", got.AccessToken)
-	count, err := cachePurgeExpired(ctx, hc)
+	count, err := cachePurgeExpired(ctx, hc, "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, count)
 	expired := &auth.Token{AccessToken: "old", TokenType: "Bearer", ExpiresAt: time.Now().Add(-time.Hour)}
-	require.NoError(t, cacheSet(ctx, hc, "expired_key", expired))
-	count, err = cachePurgeExpired(ctx, hc)
+	require.NoError(t, cacheSet(ctx, hc, "expired_key", expired, ""))
+	count, err = cachePurgeExpired(ctx, hc, "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 }
@@ -84,11 +84,11 @@ func TestCacheClear(t *testing.T) {
 	hc := newFakeHostClient(fake)
 	ctx := context.Background()
 	tok := &auth.Token{AccessToken: "x", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour)}
-	require.NoError(t, cacheSet(ctx, hc, "k1", tok))
-	require.NoError(t, cacheSet(ctx, hc, "k2", tok))
-	cacheClear(ctx, discardLogger(), hc)
-	g1, _ := cacheGet(ctx, hc, "k1")
-	g2, _ := cacheGet(ctx, hc, "k2")
+	require.NoError(t, cacheSet(ctx, hc, "k1", tok, ""))
+	require.NoError(t, cacheSet(ctx, hc, "k2", tok, ""))
+	cacheClear(ctx, discardLogger(), hc, "")
+	g1, _ := cacheGet(ctx, hc, "k1", "")
+	g2, _ := cacheGet(ctx, hc, "k2", "")
 	assert.Nil(t, g1)
 	assert.Nil(t, g2)
 }
@@ -98,8 +98,8 @@ func TestCacheListEntries(t *testing.T) {
 	hc := newFakeHostClient(fake)
 	ctx := context.Background()
 	tok := &auth.Token{AccessToken: "tok1", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour), Flow: auth.FlowDeviceCode}
-	require.NoError(t, cacheSet(ctx, hc, "entry1", tok))
-	entries, err := cacheListEntries(ctx, hc)
+	require.NoError(t, cacheSet(ctx, hc, "entry1", tok, ""))
+	entries, err := cacheListEntries(ctx, hc, "")
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, HandlerName, entries[0].Handler)
@@ -109,7 +109,7 @@ func TestCacheGetCorruptData(t *testing.T) {
 	fake := newFakeHostService()
 	hc := newFakeHostClient(fake)
 	require.NoError(t, hc.SetSecret(context.Background(), SecretKeyTokenPrefix+"corrupt", "not-json"))
-	_, err := cacheGet(context.Background(), hc, "corrupt")
+	_, err := cacheGet(context.Background(), hc, "corrupt", "")
 	assert.Error(t, err)
 }
 
@@ -208,7 +208,7 @@ func TestStoreCredentials_CachesTokenMetadata(t *testing.T) {
 			require.NoError(t, err)
 
 			fp := fingerprintHash(p.config.Hostname)
-			cached, err := cacheGet(ctx, hc, fp+":"+defaultCacheKey)
+			cached, err := cacheGet(ctx, hc, fp+":"+defaultCacheKey, "")
 			require.NoError(t, err)
 			require.NotNil(t, cached, "expected a cache entry to be created")
 
@@ -444,7 +444,7 @@ func TestListCachedTokens_WithTokens(t *testing.T) {
 	mb, _ := json.Marshal(meta)
 	_ = hc.SetSecret(ctx, SecretKeyMetadata, string(mb))
 	tok := &auth.Token{AccessToken: "at", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour)}
-	_ = cacheSet(ctx, hc, "somekey", tok)
+	_ = cacheSet(ctx, hc, "somekey", tok, "")
 	results, err := p.ListCachedTokens(ctx, HandlerName)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, len(results), 2)
@@ -455,7 +455,7 @@ func TestPurgeExpiredTokens_WithHost(t *testing.T) {
 	p := newTestPluginWithHost(nil, fake)
 	hc := newFakeHostClient(fake)
 	expired := &auth.Token{AccessToken: "old", TokenType: "Bearer", ExpiresAt: time.Now().Add(-time.Hour)}
-	_ = cacheSet(context.Background(), hc, "exp1", expired)
+	_ = cacheSet(context.Background(), hc, "exp1", expired, "")
 	count, err := p.PurgeExpiredTokens(context.Background(), HandlerName)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
