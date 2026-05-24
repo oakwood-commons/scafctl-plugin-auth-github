@@ -160,14 +160,21 @@ func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse,
 		return nil, fmt.Errorf("host service not available")
 	}
 
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return nil, err
+	}
+
 	if tokenResp.RefreshToken != "" {
-		if err := hostClient.SetSecret(ctx, SecretKeyRefreshToken, tokenResp.RefreshToken); err != nil {
+		refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
+		if err := hostClient.SetSecret(ctx, refreshKey, tokenResp.RefreshToken); err != nil {
 			return nil, fmt.Errorf("failed to store refresh token: %w", err)
 		}
 	}
 
 	if tokenResp.AccessToken != "" {
-		if err := hostClient.SetSecret(ctx, SecretKeyAccessToken, tokenResp.AccessToken); err != nil {
+		accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
+		if err := hostClient.SetSecret(ctx, accessKey, tokenResp.AccessToken); err != nil {
 			return nil, fmt.Errorf("failed to store access token: %w", err)
 		}
 	}
@@ -205,7 +212,8 @@ func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse,
 		return nil, fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
-	if err := hostClient.SetSecret(ctx, SecretKeyMetadata, string(metadataBytes)); err != nil {
+	metaKey, _ := profileSecretKey(SecretKeyMetadata, profile)
+	if err := hostClient.SetSecret(ctx, metaKey, string(metadataBytes)); err != nil {
 		return nil, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
@@ -239,7 +247,7 @@ func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse,
 			SessionID:   sessionID,
 		}
 		// Best-effort: don't fail login if caching fails.
-		if err := cacheSet(ctx, hostClient, cacheKey, cacheToken); err != nil {
+		if err := cacheSet(ctx, hostClient, cacheKey, cacheToken, profile); err != nil {
 			lgr.V(1).Info("failed to cache token after login", "error", err)
 		}
 	}
@@ -249,17 +257,32 @@ func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse,
 
 // loadRefreshToken loads the stored refresh token from the host secret store.
 func (p *Plugin) loadRefreshToken(ctx context.Context) (string, error) {
-	return p.getSecret(ctx, SecretKeyRefreshToken)
+	profile := auth.ProfileFromContext(ctx)
+	key, err := profileSecretKey(SecretKeyRefreshToken, profile)
+	if err != nil {
+		return "", err
+	}
+	return p.getSecret(ctx, key)
 }
 
 // loadAccessToken loads the stored access token from the host secret store.
 func (p *Plugin) loadAccessToken(ctx context.Context) (string, error) {
-	return p.getSecret(ctx, SecretKeyAccessToken)
+	profile := auth.ProfileFromContext(ctx)
+	key, err := profileSecretKey(SecretKeyAccessToken, profile)
+	if err != nil {
+		return "", err
+	}
+	return p.getSecret(ctx, key)
 }
 
 // loadMetadata loads the stored token metadata from the host secret store.
 func (p *Plugin) loadMetadata(ctx context.Context) (*TokenMetadata, error) {
-	data, err := p.getSecret(ctx, SecretKeyMetadata)
+	profile := auth.ProfileFromContext(ctx)
+	key, err := profileSecretKey(SecretKeyMetadata, profile)
+	if err != nil {
+		return nil, err
+	}
+	data, err := p.getSecret(ctx, key)
 	if err != nil {
 		return nil, err
 	}
