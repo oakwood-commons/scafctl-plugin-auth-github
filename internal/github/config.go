@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
@@ -214,4 +215,110 @@ func (c *Config) ValidateAppConfig(ctx context.Context, lgr logr.Logger, hostCli
 		return fmt.Errorf("github app: %w", err)
 	}
 	return nil
+}
+
+// ServerConfig is the standalone configuration for GitHub server mode,
+// passed via ActivateServerModeRequest settings.
+type ServerConfig struct {
+	// Hostname is the GitHub hostname (e.g. github.com or github.example.com for GHES).
+	Hostname string `json:"hostname,omitempty"`
+
+	// ServerFlow identifies the credential type: "pat" or "github_app".
+	ServerFlow auth.Flow `json:"serverFlow"`
+
+	// Credential holds the credential configuration for the server flow.
+	Credential CredentialConfig `json:"credential"`
+
+	// Delegated enables delegated token acquisition using the same server credential.
+	Delegated bool `json:"delegated,omitempty"`
+}
+
+// CredentialConfig specifies the credential parameters.
+type CredentialConfig struct {
+	// PAT holds the PAT credential configuration (when ServerFlow is "pat").
+	PAT *PATCredentialConfig `json:"pat,omitempty"`
+
+	// App holds the GitHub App credential configuration (when ServerFlow is "github_app").
+	App *AppCredentialConfig `json:"app,omitempty"`
+}
+
+// PATCredentialConfig holds the PAT credential reference.
+type PATCredentialConfig struct {
+	// Token is a SecretRef pointing to the PAT value (env://... or file://...).
+	Token sdkplugin.SecretRef `json:"token"`
+}
+
+// AppCredentialConfig holds the GitHub App credential references.
+type AppCredentialConfig struct {
+	// ClientID is the GitHub App's Client ID (e.g. "Iv23li...").
+	ClientID string `json:"clientId,omitempty"`
+
+	// AppID is the numeric GitHub App ID (legacy, prefer ClientID).
+	AppID int64 `json:"appId,omitempty"`
+
+	// InstallationID is the GitHub App installation ID.
+	InstallationID int64 `json:"installationId"`
+
+	// PrivateKey is a SecretRef pointing to the PEM-encoded private key.
+	PrivateKey sdkplugin.SecretRef `json:"privateKey"`
+}
+
+// Validate checks the ServerConfig for required fields.
+func (sc *ServerConfig) Validate() error {
+	if sc.ServerFlow == "" {
+		return fmt.Errorf("serverFlow is required")
+	}
+	if !isAllowedServerFlow(sc.ServerFlow) {
+		return fmt.Errorf("serverFlow %q is not allowed (allowed: pat, github_app)", sc.ServerFlow)
+	}
+
+	cc := &sc.Credential
+	switch sc.ServerFlow {
+	case auth.FlowPAT:
+		if cc.PAT == nil || cc.PAT.Token == "" {
+			return fmt.Errorf("credential.pat.token is required for pat server flow")
+		}
+		if err := cc.PAT.Token.Validate(); err != nil {
+			return fmt.Errorf("credential.pat.token: %w", err)
+		}
+	case auth.FlowGitHubApp:
+		if cc.App == nil {
+			return fmt.Errorf("credential.app is required for github_app server flow")
+		}
+		if cc.App.ClientID == "" && cc.App.AppID == 0 {
+			return fmt.Errorf("credential.app.clientId or credential.app.appId is required")
+		}
+		if cc.App.InstallationID == 0 {
+			return fmt.Errorf("credential.app.installationId is required")
+		}
+		if cc.App.PrivateKey == "" {
+			return fmt.Errorf("credential.app.privateKey is required")
+		}
+
+		if err := cc.App.PrivateKey.Validate(); err != nil {
+			return fmt.Errorf("credential.app.privateKey: %w", err)
+		}
+
+		if _, err := cc.App.PrivateKey.Resolve(); err != nil {
+			return fmt.Errorf("resolving private key: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetHostname returns the configured hostname or the default.
+func (sc *ServerConfig) GetHostname() string {
+	if sc.Hostname != "" {
+		return sc.Hostname
+	}
+	return DefaultHostname
+}
+
+// GetAPIBaseURL returns the API base URL for the configured hostname.
+func (sc *ServerConfig) GetAPIBaseURL() string {
+	h := sc.GetHostname()
+	if h == DefaultHostname {
+		return "https://api.github.com"
+	}
+	return fmt.Sprintf("https://%s/api/v3", h)
 }
