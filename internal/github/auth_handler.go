@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -90,6 +89,7 @@ func profileTokenPrefix(profile string) (string, error) {
 // BrowserOpenFunc is the signature for a function that opens a URL in the browser.
 type BrowserOpenFunc func(ctx context.Context, url string) error
 
+var _ sdkplugin.ServerMode = (*Plugin)(nil) // compile-time interface check
 // Plugin implements the scafctl AuthHandlerPlugin interface.
 type Plugin struct {
 	cfg              sdkplugin.ProviderConfig
@@ -98,6 +98,7 @@ type Plugin struct {
 	clock            clock.Clock
 	cachedHostClient *sdkplugin.HostServiceClient
 	openBrowser      BrowserOpenFunc
+	mode             mode
 }
 
 // GetAuthHandlers returns the list of auth handlers exposed by this plugin.
@@ -162,6 +163,9 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		p.openBrowser = defaultBrowserOpener
 	}
 
+	// Default to CLI mode
+	p.mode = &cliMode{p: p}
+
 	return nil
 }
 
@@ -176,38 +180,39 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 //  5. Explicit FlowInteractive or empty flow — if ClientSecret is configured,
 //     uses authorization code + PKCE; otherwise falls back to device code with
 //     automatic browser opening.
+
+// activeMode returns the current mode. This guard returns an explicit error
+// rather than panicking if the invariant is violated.
+func (p *Plugin) activeMode() (mode, error) {
+	if p.mode == nil {
+		return nil, fmt.Errorf("auth handler not configured: call ConfigureAuthHandler or ActivateServerMode first")
+	}
+	return p.mode, nil
+}
+
+// Login delegates to the active mode (CLI mode by default).
 func (p *Plugin) Login(ctx context.Context, handlerName string, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	// PAT takes priority when explicitly requested or when the environment
-	// provides a token and the caller did not ask for specific scopes.
-	if req.Flow == auth.FlowPAT || (req.Flow == "" && HasPATCredentials() && len(req.Scopes) == 0) {
-		return p.patLogin(ctx, req)
+	m, err := p.activeMode()
+	if err != nil {
+		return nil, err
 	}
-
-	switch req.Flow { //nolint:exhaustive // Only GitHub-supported flows are handled
-	case auth.FlowDeviceCode:
-		return p.deviceCodeLogin(ctx, req, deviceCodeCb)
-	case auth.FlowGitHubApp:
-		return p.appLogin(ctx)
-	case auth.FlowInteractive, "":
-		if p.config.ClientSecret != "" {
-			return p.authCodeLogin(ctx, req, deviceCodeCb)
-		}
-		return p.interactiveDeviceCodeLogin(ctx, req, deviceCodeCb)
-	default:
-		return nil, fmt.Errorf("unsupported flow: %s", req.Flow)
-	}
+	return m.Login(ctx, req, deviceCodeCb)
 }
 
 // Logout revokes the current session.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) Logout(ctx context.Context, handlerName string) error {
 	if handlerName != HandlerName {
 		return fmt.Errorf("unknown handler: %s", handlerName)
 	}
-	return p.logoutInternal(ctx)
+	m, err := p.activeMode()
+	if err != nil {
+		return err
+	}
+	return m.Logout(ctx)
 }
 
 // logoutInternal clears stored credentials and cached tokens.
@@ -250,318 +255,69 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 }
 
 // GetStatus returns the current authentication status.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) GetStatus(ctx context.Context, handlerName string) (*auth.Status, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	profile := auth.ProfileFromContext(ctx)
-	if err := validateProfile(profile); err != nil {
+	m, err := p.activeMode()
+	if err != nil {
 		return nil, err
 	}
-
-	// Check for PAT credentials first (highest priority)
-	if HasPATCredentials() {
-		return p.patStatus(ctx)
-	}
-
-	// Check if we have stored credentials
-	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
-	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
-	hasRefresh := p.secretExists(ctx, refreshKey)
-	hasAccess := p.secretExists(ctx, accessKey)
-
-	if !hasRefresh && !hasAccess {
-		return &auth.Status{Authenticated: false}, nil
-	}
-
-	// Load and validate metadata
-	metadata, err := p.loadMetadata(ctx)
-	if err != nil {
-		return &auth.Status{Authenticated: false}, nil //nolint:nilerr // corrupted metadata = not authenticated
-	}
-
-	// Check if refresh token is expired
-	if !metadata.RefreshTokenExpiresAt.IsZero() && time.Now().After(metadata.RefreshTokenExpiresAt) {
-		return &auth.Status{
-			Authenticated: false,
-			Reason:        "session expired",
-			Claims:        metadata.Claims,
-		}, nil
-	}
-
-	return &auth.Status{
-		Authenticated: true,
-		Claims:        metadata.Claims,
-		ExpiresAt:     metadata.RefreshTokenExpiresAt,
-		LastRefresh:   metadata.LastRefresh,
-		IdentityType:  auth.IdentityTypeUser,
-		ClientID:      metadata.ClientID,
-		Scopes:        metadata.Scopes,
-	}, nil
+	return m.GetStatus(ctx)
 }
 
 // GetToken returns a valid access token, refreshing if necessary.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	lgr := logr.FromContextOrDiscard(ctx)
-
-	profile := auth.ProfileFromContext(ctx)
-	if err := validateProfile(profile); err != nil {
-		return nil, err
-	}
-
-	// Use PAT flow if credentials are present (highest priority)
-	if HasPATCredentials() {
-		return p.getPATToken(ctx, req)
-	}
-
-	minValidFor := req.MinValidFor
-	if minValidFor == 0 {
-		minValidFor = auth.DefaultMinValidFor
-	}
-
-	lgr.V(1).Info("getting token",
-		"handler", HandlerName,
-		"minValidFor", minValidFor,
-		"forceRefresh", req.ForceRefresh,
-	)
-
-	hostClient := p.hostClient(ctx)
-	fp := fingerprintHash(p.config.Hostname)
-	cacheKey := fp + ":" + defaultCacheKey
-
-	// Check cache first (unless force refresh)
-	if !req.ForceRefresh && hostClient != nil {
-		token, err := cacheGet(ctx, hostClient, cacheKey, profile)
-		if err == nil && token != nil && token.IsValidFor(minValidFor) {
-			lgr.V(1).Info("using cached token",
-				"expiresAt", token.ExpiresAt,
-				"remainingValidity", token.TimeUntilExpiry(),
-			)
-			return &sdkplugin.TokenResponse{
-				AccessToken: token.AccessToken,
-				TokenType:   token.TokenType,
-				ExpiresAt:   token.ExpiresAt,
-				Scope:       token.Scope,
-				Flow:        token.Flow,
-				SessionID:   token.SessionID,
-			}, nil
-		}
-		if err != nil {
-			lgr.V(1).Info("cache lookup failed, will mint new token", "error", err)
-		} else if token != nil {
-			lgr.V(1).Info("cached token insufficient validity",
-				"expiresAt", token.ExpiresAt,
-				"remainingValidity", token.TimeUntilExpiry(),
-				"requiredValidity", minValidFor,
-			)
-		}
-	}
-
-	// Check if we have a stored access token (non-expiring OAuth App)
-	accessToken, err := p.loadAccessToken(ctx)
-	if err == nil && accessToken != "" {
-		token := &auth.Token{
-			AccessToken: accessToken,
-			TokenType:   "Bearer",
-			ExpiresAt:   farFuture(),
-		}
-		if hostClient != nil {
-			if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
-				lgr.V(1).Info("failed to cache token", "error", cacheErr)
-			}
-		}
-		return &sdkplugin.TokenResponse{
-			AccessToken: token.AccessToken,
-			TokenType:   token.TokenType,
-			ExpiresAt:   token.ExpiresAt,
-		}, nil
-	}
-
-	// Try to mint new token using refresh token
-	token, err := p.mintToken(ctx)
+	m, err := p.activeMode()
 	if err != nil {
 		return nil, err
 	}
-
-	// Cache the token
-	if hostClient != nil {
-		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
-			lgr.V(1).Info("failed to cache token", "error", cacheErr)
-		}
-	}
-
-	return &sdkplugin.TokenResponse{
-		AccessToken: token.AccessToken,
-		TokenType:   token.TokenType,
-		ExpiresAt:   token.ExpiresAt,
-		Scope:       token.Scope,
-		Flow:        token.Flow,
-		SessionID:   token.SessionID,
-	}, nil
+	return m.GetToken(ctx, req)
 }
 
 // ListCachedTokens returns metadata for all tokens stored by the GitHub handler.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*auth.CachedTokenInfo, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	hostClient := p.hostClient(ctx)
-	if hostClient == nil {
-		return nil, fmt.Errorf("host service not available")
-	}
-
-	var results []*auth.CachedTokenInfo
-
-	profile := auth.ProfileFromContext(ctx)
-	if err := validateProfile(profile); err != nil {
+	m, err := p.activeMode()
+	if err != nil {
 		return nil, err
 	}
-
-	// Refresh token (device code flow with token expiry enabled)
-	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
-	if p.secretExists(ctx, refreshKey) {
-		info := &auth.CachedTokenInfo{
-			Handler:   HandlerName,
-			TokenKind: "refresh",
-			Flow:      auth.FlowDeviceCode,
-		}
-		if metadata, err := p.loadMetadata(ctx); err == nil && metadata != nil {
-			info.ExpiresAt = metadata.RefreshTokenExpiresAt
-			info.CachedAt = metadata.LastRefresh
-			info.SessionID = metadata.SessionID
-			if metadata.Flow != "" {
-				info.Flow = metadata.Flow
-			}
-		}
-		if !info.ExpiresAt.IsZero() {
-			info.IsExpired = time.Now().After(info.ExpiresAt)
-		}
-		results = append(results, info)
-	}
-
-	// Minted access tokens from cache
-	entries, _ := cacheListEntries(ctx, hostClient, profile)
-	results = append(results, entries...)
-
-	// Direct access token not in cache
-	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
-	if p.secretExists(ctx, accessKey) {
-		fp := fingerprintHash(p.config.Hostname)
-		cacheKey := fp + ":" + defaultCacheKey
-		cached, cacheErr := cacheGet(ctx, hostClient, cacheKey, profile)
-		if cacheErr != nil || cached == nil {
-			info := &auth.CachedTokenInfo{
-				Handler:   HandlerName,
-				TokenKind: "access",
-				TokenType: "Bearer",
-			}
-			if metadata, err := p.loadMetadata(ctx); err == nil && metadata != nil {
-				info.CachedAt = metadata.LastRefresh
-				info.SessionID = metadata.SessionID
-				info.Flow = metadata.Flow
-			}
-			results = append(results, info)
-		}
-	}
-
-	return results, nil
+	return m.ListCachedTokens(ctx)
 }
 
 // PurgeExpiredTokens removes expired access tokens from the cache.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (int, error) {
 	if handlerName != HandlerName {
 		return 0, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	hostClient := p.hostClient(ctx)
-	if hostClient == nil {
-		return 0, nil
-	}
-
-	profile := auth.ProfileFromContext(ctx)
-	if err := validateProfile(profile); err != nil {
+	m, err := p.activeMode()
+	if err != nil {
 		return 0, err
 	}
-
-	return cachePurgeExpired(ctx, hostClient, profile)
+	return m.PurgeExpiredTokens(ctx)
 }
 
 // DetectAvailableFlows reports which auth flows are available based on
 // environment credentials or configuration.
-func (p *Plugin) DetectAvailableFlows(_ context.Context, handlerName string) ([]sdkplugin.FlowAvailability, error) {
+// Delegates to the active mode (CLI mode by default).
+func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) ([]sdkplugin.FlowAvailability, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	var flows []sdkplugin.FlowAvailability
-
-	// PAT flow -- check environment variables
-	if HasPATCredentials() {
-		envVar := EnvGitHubToken
-		if GetPATFromEnv() == os.Getenv(EnvGHToken) && os.Getenv(EnvGitHubToken) == "" {
-			envVar = EnvGHToken
-		}
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowPAT,
-			Available: true,
-			Reason:    fmt.Sprintf("%s is set", envVar),
-		})
-	} else {
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowPAT,
-			Available: false,
-			Reason:    fmt.Sprintf("neither %s nor %s is set", EnvGitHubToken, EnvGHToken),
-		})
+	m, err := p.activeMode()
+	if err != nil {
+		return nil, err
 	}
-
-	// GitHub App flow -- check for app ID and private key indicators
-	hasAppID := p.config.GetAppID() != 0
-	hasPrivateKey := p.config.PrivateKey != "" || p.config.PrivateKeyPath != "" ||
-		p.config.PrivateKeySecretName != "" ||
-		os.Getenv(EnvGitHubAppPrivateKey) != "" ||
-		os.Getenv(EnvGitHubAppPrivateKeyPath) != ""
-
-	if hasAppID && hasPrivateKey {
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowGitHubApp,
-			Available: true,
-			Reason:    "GitHub App ID and private key are configured",
-		})
-	} else {
-		reason := "GitHub App credentials not configured"
-		if hasAppID && !hasPrivateKey {
-			reason = "GitHub App ID is set but private key is missing"
-		} else if !hasAppID && hasPrivateKey {
-			reason = "private key is set but GitHub App ID is missing"
-		}
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowGitHubApp,
-			Available: false,
-			Reason:    reason,
-		})
-	}
-
-	// Device code flow -- always available (uses built-in OAuth App client ID)
-	flows = append(flows, sdkplugin.FlowAvailability{
-		Flow:      auth.FlowDeviceCode,
-		Available: true,
-		Reason:    "device code flow is always available",
-	})
-
-	// Interactive flow -- always available
-	flows = append(flows, sdkplugin.FlowAvailability{
-		Flow:      auth.FlowInteractive,
-		Available: true,
-		Reason:    "interactive flow is always available",
-	})
-
-	return flows, nil
+	return m.DetectAvailableFlows(ctx)
 }
 
 // StopAuthHandler performs cleanup before plugin unload.

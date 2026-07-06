@@ -188,12 +188,18 @@ func (p *Plugin) getAppInfo(ctx context.Context, appJWT string) (*AppInfo, error
 
 // createInstallationToken exchanges a GitHub App JWT for an installation access token.
 func (p *Plugin) createInstallationToken(ctx context.Context, appJWT string, installationID int64) (*InstallationTokenResponse, error) {
-	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", p.config.GetAPIBaseURL(), installationID)
+	return createInstallationTokenHTTP(ctx, p.httpClient, p.config.GetAPIBaseURL(), appJWT, installationID)
+}
+
+// createInstallationTokenHTTP exchanges a GitHub App JWT for an installation access token
+// using the provided HTTP client and API base URL.
+func createInstallationTokenHTTP(ctx context.Context, httpClient HTTPClient, apiBaseURL string, appJWT string, installationID int64) (*InstallationTokenResponse, error) {
+	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", apiBaseURL, installationID)
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", appJWT),
 	}
 
-	resp, err := p.httpClient.PostJSON(ctx, endpoint, nil, headers)
+	resp, err := httpClient.PostJSON(ctx, endpoint, nil, headers)
 	if err != nil {
 		return nil, fmt.Errorf("create installation token failed: %w", err)
 	}
