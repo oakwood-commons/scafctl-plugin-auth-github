@@ -395,7 +395,7 @@ func TestLogout_WithHostClient(t *testing.T) {
 	_ = hc.SetSecret(ctx, SecretKeyRefreshToken, "rt")
 	_ = hc.SetSecret(ctx, SecretKeyAccessToken, "at")
 	_ = hc.SetSecret(ctx, SecretKeyMetadata, "meta")
-	require.NoError(t, p.Logout(ctx, HandlerName))
+	require.NoError(t, p.Logout(ctx, HandlerName, sdkplugin.LogoutRequest{}))
 	_, found, _ := hc.GetSecret(ctx, SecretKeyRefreshToken)
 	assert.False(t, found)
 }
@@ -411,7 +411,7 @@ func TestGetStatus_StoredCredentials(t *testing.T) {
 	meta := &TokenMetadata{Claims: &auth.Claims{Subject: "stored_user"}, RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour), LastRefresh: time.Now(), Hostname: DefaultHostname, ClientID: DefaultClientID, Scopes: []string{"repo"}}
 	mb, _ := json.Marshal(meta)
 	_ = hc.SetSecret(ctx, SecretKeyMetadata, string(mb))
-	status, err := p.GetStatus(ctx, HandlerName)
+	status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 	assert.Equal(t, "stored_user", status.Claims.Subject)
@@ -428,7 +428,7 @@ func TestGetStatus_ExpiredSession(t *testing.T) {
 	meta := &TokenMetadata{Claims: &auth.Claims{Subject: "exp"}, RefreshTokenExpiresAt: time.Now().Add(-time.Hour), LastRefresh: time.Now().Add(-25 * time.Hour), Hostname: DefaultHostname, ClientID: DefaultClientID}
 	mb, _ := json.Marshal(meta)
 	_ = hc.SetSecret(ctx, SecretKeyMetadata, string(mb))
-	status, err := p.GetStatus(ctx, HandlerName)
+	status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 	assert.Equal(t, "session expired", status.Reason)

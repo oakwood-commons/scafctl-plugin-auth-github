@@ -106,14 +106,14 @@ func TestLogin(t *testing.T) {
 func TestLogout(t *testing.T) {
 	t.Run("unknown handler", func(t *testing.T) {
 		p := newTestPlugin(nil)
-		err := p.Logout(context.Background(), "unknown")
+		err := p.Logout(context.Background(), "unknown", sdkplugin.LogoutRequest{})
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "unknown handler")
 	})
 
 	t.Run("known handler no host client", func(t *testing.T) {
 		p := newTestPlugin(nil)
-		err := p.Logout(context.Background(), HandlerName)
+		err := p.Logout(context.Background(), HandlerName, sdkplugin.LogoutRequest{})
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "host service not available")
 	})
@@ -122,7 +122,7 @@ func TestLogout(t *testing.T) {
 func TestGetStatus(t *testing.T) {
 	t.Run("unknown handler", func(t *testing.T) {
 		p := newTestPlugin(nil)
-		_, err := p.GetStatus(context.Background(), "unknown")
+		_, err := p.GetStatus(context.Background(), "unknown", sdkplugin.StatusRequest{})
 		assert.Error(t, err)
 	})
 
@@ -130,7 +130,7 @@ func TestGetStatus(t *testing.T) {
 		p := newTestPlugin(nil)
 		t.Setenv(EnvGitHubToken, "")
 		t.Setenv(EnvGHToken, "")
-		status, err := p.GetStatus(context.Background(), HandlerName)
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.False(t, status.Authenticated)
 	})
@@ -146,7 +146,7 @@ func TestGetStatus(t *testing.T) {
 		p := newTestPlugin(mock)
 		t.Setenv(EnvGitHubToken, "ghp_valid_pat")
 
-		status, err := p.GetStatus(context.Background(), HandlerName)
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.True(t, status.Authenticated)
 		assert.Equal(t, "testuser", status.Claims.Subject)
@@ -159,7 +159,7 @@ func TestGetStatus(t *testing.T) {
 		p := newTestPlugin(mock)
 		t.Setenv(EnvGitHubToken, "ghp_invalid")
 
-		status, err := p.GetStatus(context.Background(), HandlerName)
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.False(t, status.Authenticated)
 	})
@@ -684,7 +684,7 @@ func TestProfileIsolation_LogoutOnlyAffectsProfile(t *testing.T) {
 	require.NoError(t, err)
 
 	// Logout work profile.
-	err = p.Logout(workCtx, HandlerName)
+	err = p.Logout(workCtx, HandlerName, sdkplugin.LogoutRequest{})
 	require.NoError(t, err)
 
 	// Work profile tokens are gone.
@@ -753,12 +753,12 @@ func TestProfileIsolation_GetStatus(t *testing.T) {
 	require.NoError(t, err)
 
 	// Default profile: authenticated.
-	status, err := p.GetStatus(defaultCtx, HandlerName)
+	status, err := p.GetStatus(defaultCtx, HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 
 	// Work profile: not authenticated.
-	status, err = p.GetStatus(workCtx, HandlerName)
+	status, err = p.GetStatus(workCtx, HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 }
