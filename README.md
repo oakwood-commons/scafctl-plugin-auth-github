@@ -11,12 +11,11 @@ This plugin uses the following names across different surfaces:
 | Repository | `scafctl-plugin-auth-github` |
 | Go module | `github.com/oakwood-commons/scafctl-plugin-auth-github` |
 | Binary | `scafctl-plugin-auth-github` |
-| Provider name | `auth-github` |
+| Auth handler name | `github` |
 | Catalog artifact | `auth-github` |
 
-The **provider name** is what users reference in solutions (`provider: auth-github`).
-It comes from the RPC contract (`GetProviders` / `GetProviderDescriptor`), not from
-the binary filename.
+The **auth handler name** is what users reference in CLI commands and solutions (`auth: github`).
+It comes from the RPC contract (`GetAuthHandlers`), not from the binary filename.
 
 ## Installation
 
@@ -33,9 +32,53 @@ gh release download --repo github.com/oakwood-commons/scafctl-plugin-auth-github
 Register this plugin in your scafctl configuration, then use
 the **github** auth handler:
 
-```bash
+~~~bash
+# Interactive login (authorization code + PKCE when clientSecret is configured,
+# or device code with automatic browser launch otherwise)
 scafctl auth login github
-```
+
+# Open a specific browser (or set $BROWSER as a fallback)
+scafctl auth login github --flow interactive --browser msedge
+
+# Pin the localhost OAuth callback port for SSH or devcontainer port forwarding
+scafctl auth login github --flow interactive --callback-port 8400
+
+# Authenticate against a GitHub Enterprise Server (GHES) instance
+scafctl auth login github --hostname github.example.com
+
+# Sign in to isolated named profiles (e.g., github.com and GHES side-by-side)
+scafctl auth login github --profile personal
+scafctl auth login github --profile enterprise
+scafctl auth status github --profile enterprise
+~~~
+
+### Configuration and Profiles
+
+Keys under `auth.github` (or per-profile under `auth.github.profiles.<name>`):
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `clientId` | Built-in scafctl OAuth App ID | GitHub OAuth App or GitHub App client ID |
+| `clientSecret` | *(unset)* | Enables authorization code + PKCE interactive callback flow |
+| `hostname` | `github.com` | GitHub hostname (`github.com` or GHES hostname such as `github.example.com`) |
+| `defaultScopes` | *(unset)* | OAuth scopes requested at login when `--scope` is omitted |
+| `appId` | *(unset)* | GitHub App numeric ID (or `GITHUB_APP_ID`) |
+| `installationId` | *(unset)* | GitHub App installation ID (or `GITHUB_APP_INSTALLATION_ID`) |
+| `privateKey` / `privateKeyPath` / `privateKeySecretName` | *(unset)* | GitHub App PEM private key source |
+| `httpClient` | 30s timeout, 3 retries, cache off | Optional `httpc` client settings isolated per effective configuration |
+
+Environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `GITHUB_TOKEN` / `GH_TOKEN` | Personal access token (`GITHUB_TOKEN` takes precedence) |
+| `GITHUB_APP_ID` / `GITHUB_APP_INSTALLATION_ID` | GitHub App identifiers for `github_app` flow |
+| `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` | GitHub App PEM private key or file path |
+| `BROWSER` | Preferred browser executable or fallback list when `--browser` is not passed; falls back to the OS default browser with a warning if unavailable |
+
+### Interactive Callback Pages
+
+During the authorization code + PKCE interactive flow (`clientSecret` configured), the loopback callback server renders branded HTML pages supplied by the host via `ProviderConfig.AuthCallbackPages` (falling back to the built-in `oauth-helpers` pages when unset, and enforcing `MaxAuthCallbackPageBytes`). Callback completion is deferred until authorization code exchange and credential storage finish so post-callback failures render `503 Service Unavailable` with the failure page instead of a false-positive success page.
 
 Once authenticated, reference it in HTTP requests:
 

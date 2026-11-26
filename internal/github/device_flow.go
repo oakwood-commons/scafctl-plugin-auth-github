@@ -8,13 +8,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	oauth "github.com/oakwood-commons/oauth-helpers"
-	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
+	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
 // DeviceCodeResponse represents the response from GitHub's device code endpoint.
@@ -26,15 +29,43 @@ type DeviceCodeResponse struct {
 	Interval        int    `json:"interval"`
 }
 
-// defaultBrowserOpener opens a URL in the system browser using the oauth-helpers package.
-func defaultBrowserOpener(ctx context.Context, url string) error {
-	return oauth.OpenBrowser(ctx, url)
+type browserPreferenceKeyType struct{}
+
+func withBrowserPreference(ctx context.Context, browser string) context.Context {
+	if browser == "" {
+		if existing := browserPreferenceFromContext(ctx); existing != "" {
+			return ctx
+		}
+	}
+	return context.WithValue(ctx, browserPreferenceKeyType{}, browser)
+}
+
+func browserPreferenceFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(browserPreferenceKeyType{}).(string)
+	return v
+}
+
+// defaultBrowserOpener opens a URL in the user's preferred or system browser
+// using the oauth-helpers package, logging fallback warnings when a configured
+// browser preference or $BROWSER cannot be launched.
+func defaultBrowserOpener(ctx context.Context, rawURL string) error {
+	return oauth.OpenBrowserWithPreference(
+		ctx,
+		rawURL,
+		browserPreferenceFromContext(ctx),
+		oauth.WithWarningHandler(func(msg string) {
+			logr.FromContextOrDiscard(ctx).V(0).Info(msg)
+		}),
+	)
 }
 
 // browserOpener returns the configured browser opener or the default.
 func (p *Plugin) browserOpener() BrowserOpenFunc {
-	if p.openBrowser != nil {
-		return p.openBrowser
+	p.mu.RLock()
+	opener := p.openBrowser
+	p.mu.RUnlock()
+	if opener != nil {
+		return opener
 	}
 	return defaultBrowserOpener
 }
@@ -44,9 +75,21 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting GitHub device code authentication flow")
 
+	if err := validateProfile(auth.ProfileFromContext(ctx)); err != nil {
+		return nil, err
+	}
+
+	ctx = withHostnameOverride(ctx, req.Hostname)
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+	ctx = withBrowserPreference(ctx, req.Browser)
+
 	scopes := req.Scopes
 	if len(scopes) == 0 {
-		scopes = p.config.DefaultScopes
+		scopes = cfg.DefaultScopes
 	}
 
 	timeout := req.Timeout
@@ -66,9 +109,21 @@ func (p *Plugin) interactiveDeviceCodeLogin(ctx context.Context, req sdkplugin.L
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting GitHub interactive flow (device code with browser auto-open)")
 
+	if err := validateProfile(auth.ProfileFromContext(ctx)); err != nil {
+		return nil, err
+	}
+
+	ctx = withHostnameOverride(ctx, req.Hostname)
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+	ctx = withBrowserPreference(ctx, req.Browser)
+
 	scopes := req.Scopes
 	if len(scopes) == 0 {
-		scopes = p.config.DefaultScopes
+		scopes = cfg.DefaultScopes
 	}
 	timeout := req.Timeout
 	if timeout == 0 {
@@ -97,6 +152,10 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, scopes []string, ope
 	)
 
 	if openBrowser {
+		lgr.V(1).Info("opening browser for device code authentication",
+			"url", deviceCode.VerificationURI,
+			"browser", browserPreferenceFromContext(ctx),
+		)
 		if err := p.browserOpener()(ctx, deviceCode.VerificationURI); err != nil {
 			lgr.V(0).Info("could not open browser automatically", "url", deviceCode.VerificationURI)
 		}
@@ -135,16 +194,54 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, scopes []string, ope
 	}, nil
 }
 
+func validateVerificationURI(rawURI, expectedHostname string) (string, error) {
+	trimmed := strings.TrimSpace(rawURI)
+	if trimmed == "" || !utf8.ValidString(trimmed) {
+		return "", fmt.Errorf("invalid verification_uri in device code response")
+	}
+	for _, r := range trimmed {
+		if r <= 0x20 || r == 0x7f || unicode.IsSpace(r) || unicode.IsControl(r) ||
+			r == 0x061c || r == 0x200e || r == 0x200f ||
+			(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
+			return "", fmt.Errorf("verification_uri contains disallowed characters")
+		}
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.User != nil || parsed.Hostname() == "" {
+		return "", fmt.Errorf("verification_uri must be a valid https URL")
+	}
+	expectedHost := expectedHostname
+	if expParsed, pErr := url.Parse("https://" + expectedHostname); pErr == nil && expParsed.Hostname() != "" {
+		expectedHost = expParsed.Hostname()
+	}
+	uriHost := strings.ToLower(parsed.Hostname())
+	wantHost := strings.ToLower(expectedHost)
+	if uriHost != wantHost && !strings.HasSuffix(uriHost, "."+wantHost) {
+		return "", fmt.Errorf("verification_uri host %q does not match configured hostname %q", parsed.Hostname(), expectedHostname)
+	}
+	return trimmed, nil
+}
+
 // requestDeviceCode requests a device code from GitHub.
 func (p *Plugin) requestDeviceCode(ctx context.Context, scopes []string) (*DeviceCodeResponse, error) {
-	endpoint := fmt.Sprintf("%s/login/device/code", p.config.GetOAuthBaseURL())
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, releaseHTTP, err := p.acquireHTTPClient(ctx, cfg, true)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHTTP()
+
+	endpoint := fmt.Sprintf("%s/login/device/code", cfg.GetOAuthBaseURL())
 
 	data := makeFormData(map[string]string{
-		"client_id": p.config.ClientID,
+		"client_id": cfg.ClientID,
 		"scope":     strings.Join(scopes, " "),
 	})
 
-	resp, err := p.httpClient.PostForm(ctx, endpoint, data)
+	resp, err := httpClient.PostForm(ctx, endpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("device code request failed: %w", err)
 	}
@@ -155,7 +252,8 @@ func (p *Plugin) requestDeviceCode(ctx context.Context, scopes []string) (*Devic
 		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
 			return nil, fmt.Errorf("device code request failed with status %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("device code request failed: %s - %s", errResp.Error, errResp.ErrorDescription)
+		return nil, fmt.Errorf("device code request failed: %s - %s",
+			sanitizeControlChars(errResp.Error), sanitizeControlChars(errResp.ErrorDescription))
 	}
 
 	var deviceCode DeviceCodeResponse
@@ -163,15 +261,35 @@ func (p *Plugin) requestDeviceCode(ctx context.Context, scopes []string) (*Devic
 		return nil, fmt.Errorf("failed to parse device code response: %w", err)
 	}
 
+	deviceCode.UserCode = sanitizeControlChars(deviceCode.UserCode)
+	if deviceCode.DeviceCode == "" || deviceCode.UserCode == "" {
+		return nil, fmt.Errorf("device code response missing required fields")
+	}
+	validURI, err := validateVerificationURI(deviceCode.VerificationURI, cfg.Hostname)
+	if err != nil {
+		return nil, err
+	}
+	deviceCode.VerificationURI = validURI
+
 	return &deviceCode, nil
 }
 
 // pollForToken polls GitHub's token endpoint until the user completes authentication.
 func (p *Plugin) pollForToken(ctx context.Context, deviceCode *DeviceCodeResponse) (*TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
-	endpoint := fmt.Sprintf("%s/login/oauth/access_token", p.config.GetOAuthBaseURL())
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, releaseHTTP, err := p.acquireHTTPClient(ctx, cfg, true)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHTTP()
 
-	minPollInterval := p.config.MinPollInterval
+	endpoint := fmt.Sprintf("%s/login/oauth/access_token", cfg.GetOAuthBaseURL())
+
+	minPollInterval := cfg.MinPollInterval
 	if minPollInterval == 0 {
 		minPollInterval = DefaultMinPollInterval
 	}
@@ -181,7 +299,7 @@ func (p *Plugin) pollForToken(ctx context.Context, deviceCode *DeviceCodeRespons
 		interval = minPollInterval
 	}
 
-	ticker := p.clock.NewTicker(interval)
+	ticker := p.getClock().NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -190,13 +308,16 @@ func (p *Plugin) pollForToken(ctx context.Context, deviceCode *DeviceCodeRespons
 			return nil, fmt.Errorf("authentication timed out")
 		case <-ticker.C():
 			data := makeFormData(map[string]string{
-				"client_id":   p.config.ClientID,
+				"client_id":   cfg.ClientID,
 				"device_code": deviceCode.DeviceCode,
 				"grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
 			})
 
-			resp, err := p.httpClient.PostForm(ctx, endpoint, data)
+			resp, err := httpClient.PostForm(ctx, endpoint, data)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("authentication timed out")
+				}
 				lgr.V(1).Info("transient network error during token poll, continuing", "error", err)
 				continue
 			}
@@ -226,7 +347,7 @@ func (p *Plugin) pollForToken(ctx context.Context, deviceCode *DeviceCodeRespons
 			case "authorization_pending":
 				continue
 			case "slow_down":
-				slowDownIncr := p.config.SlowDownIncrement
+				slowDownIncr := cfg.SlowDownIncrement
 				if slowDownIncr == 0 {
 					slowDownIncr = 5 * time.Second
 				}
@@ -239,7 +360,8 @@ func (p *Plugin) pollForToken(ctx context.Context, deviceCode *DeviceCodeRespons
 			case "access_denied":
 				return nil, fmt.Errorf("user cancelled authentication")
 			default:
-				return nil, fmt.Errorf("token request failed: %s - %s", body.Error, body.ErrorDescription)
+				return nil, fmt.Errorf("token request failed: %s - %s",
+					sanitizeControlChars(body.Error), sanitizeControlChars(body.ErrorDescription))
 			}
 		}
 	}

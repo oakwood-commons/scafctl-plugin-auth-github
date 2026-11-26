@@ -82,23 +82,30 @@ func cacheSet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cach
 	return hostClient.SetSecret(ctx, prefix+cacheKey, string(data))
 }
 
-// cacheClear removes all cached tokens from the host secret store.
+// cacheClear removes all cached tokens from the host secret store, logging errors.
 func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient, profile string) {
+	if err := cacheClearErr(ctx, hostClient, profile); err != nil {
+		lgr.V(1).Info("failed to clear cached tokens", "error", err)
+	}
+}
+
+// cacheClearErr removes all cached tokens for profile and returns the first error encountered.
+func cacheClearErr(ctx context.Context, hostClient *sdkplugin.HostServiceClient, profile string) error {
 	prefix, err := profileTokenPrefix(profile)
 	if err != nil {
-		lgr.V(1).Info("invalid profile for cache clear", "error", err)
-		return
+		return err
 	}
 	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
-		lgr.V(1).Info("failed to list cached tokens", "error", err)
-		return
+		return fmt.Errorf("listing cached tokens: %w", err)
 	}
+	var firstErr error
 	for _, key := range keys {
-		if err := hostClient.DeleteSecret(ctx, key); err != nil {
-			lgr.V(1).Info("failed to delete cached token", "key", key, "error", err)
+		if delErr := hostClient.DeleteSecret(ctx, key); delErr != nil && firstErr == nil {
+			firstErr = fmt.Errorf("deleting cached token %q: %w", key, delErr)
 		}
 	}
+	return firstErr
 }
 
 // cacheListEntries lists all cached token entries.

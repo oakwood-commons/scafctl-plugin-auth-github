@@ -5,6 +5,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -22,15 +23,27 @@ type cliMode struct {
 // Login performs the authentication flow in CLI mode.
 //
 // Flow selection precedence:
-//  1. Explicit FlowPAT — uses PAT from environment.
-//  2. Implicit PAT — when no flow is specified, GITHUB_TOKEN/GH_TOKEN is set,
+//  1. Explicit FlowPAT -- uses PAT from environment.
+//  2. Implicit PAT -- when no flow is specified, GITHUB_TOKEN/GH_TOKEN is set,
 //     and no explicit scopes are requested, PAT is used automatically.
-//  3. Explicit FlowDeviceCode — device code polling flow.
-//  4. Explicit FlowGitHubApp — GitHub App installation token flow.
-//  5. Explicit FlowInteractive or empty flow — if ClientSecret is configured,
+//  3. Explicit FlowDeviceCode -- device code polling flow.
+//  4. Explicit FlowGitHubApp -- GitHub App installation token flow.
+//  5. Explicit FlowInteractive or empty flow -- if ClientSecret is configured,
 //     uses authorization code + PKCE; otherwise falls back to device code with
 //     automatic browser opening.
 func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
+	if err := validateProfile(auth.ProfileFromContext(ctx)); err != nil {
+		return nil, err
+	}
+
+	ctx = withHostnameOverride(ctx, req.Hostname)
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+	ctx = withBrowserPreference(ctx, req.Browser)
+
 	// PAT takes priority when explicitly requested or when the environment
 	// provides a token and the caller did not ask for specific scopes.
 	if req.Flow == auth.FlowPAT || (req.Flow == "" && HasPATCredentials() && len(req.Scopes) == 0) {
@@ -43,7 +56,7 @@ func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceC
 	case auth.FlowGitHubApp:
 		return m.p.appLogin(ctx)
 	case auth.FlowInteractive, "":
-		if m.p.config.ClientSecret != "" {
+		if cfg.ClientSecret != "" {
 			return m.p.authCodeLogin(ctx, req, deviceCodeCb)
 		}
 		return m.p.interactiveDeviceCodeLogin(ctx, req, deviceCodeCb)
@@ -65,29 +78,67 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 		return nil, err
 	}
 
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	// Check for PAT credentials first (highest priority)
 	if HasPATCredentials() {
 		return m.p.patStatus(ctx)
 	}
 
-	// Check if we have stored credentials
+	mu := m.p.profileLock(profile)
+	mu.RLock()
 	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
 	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
 	hasRefresh := m.p.secretExists(ctx, refreshKey)
 	hasAccess := m.p.secretExists(ctx, accessKey)
-
 	if !hasRefresh && !hasAccess {
+		mu.RUnlock()
 		return &auth.Status{Authenticated: false}, nil
 	}
-
-	// Load and validate metadata
-	metadata, err := m.p.loadMetadata(ctx)
+	metadata, err := m.p.loadMetadataUnlocked(ctx)
+	mu.RUnlock()
 	if err != nil {
 		return &auth.Status{Authenticated: false}, nil //nolint:nilerr // corrupted metadata = not authenticated
 	}
 
-	// Check if refresh token is expired
-	if !metadata.RefreshTokenExpiresAt.IsZero() && time.Now().After(metadata.RefreshTokenExpiresAt) {
+	if _, hostErr := resolveSessionConfig(cfg, metadata); hostErr != nil {
+		var mismatch *hostnameMismatchError
+		if errors.As(hostErr, &mismatch) {
+			return &auth.Status{
+				Authenticated: false,
+				Reason:        fmt.Sprintf("authenticated to %s, not %s", mismatch.stored, mismatch.requested),
+				Hostname:      cfg.Hostname,
+			}, nil
+		}
+		var appMismatch *appConfigMismatchError
+		if errors.As(hostErr, &appMismatch) {
+			return &auth.Status{
+				Authenticated: false,
+				Reason:        appMismatch.Error(),
+				Hostname:      metadata.Hostname,
+			}, nil
+		}
+		return &auth.Status{Authenticated: false}, nil //nolint:nilerr // invalid stored hostname = not authenticated
+	}
+
+	expiresAt := metadata.RefreshTokenExpiresAt
+	if isGitHubAppSession(metadata) {
+		if metadata.AccessTokenExpiresAt.IsZero() {
+			return &auth.Status{
+				Authenticated: false,
+				Reason:        "session expired",
+				Claims:        metadata.Claims,
+			}, nil
+		}
+		expiresAt = metadata.AccessTokenExpiresAt
+	}
+
+	// Check if session/token is expired
+	if !expiresAt.IsZero() && time.Now().After(expiresAt) {
 		return &auth.Status{
 			Authenticated: false,
 			Reason:        "session expired",
@@ -95,14 +146,21 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 		}, nil
 	}
 
+	identityType := auth.IdentityTypeUser
+	if metadata.IdentityType != "" {
+		identityType = auth.IdentityType(metadata.IdentityType)
+	}
+
 	return &auth.Status{
 		Authenticated: true,
 		Claims:        metadata.Claims,
-		ExpiresAt:     metadata.RefreshTokenExpiresAt,
+		ExpiresAt:     expiresAt,
 		LastRefresh:   metadata.LastRefresh,
-		IdentityType:  auth.IdentityTypeUser,
+		IdentityType:  identityType,
 		ClientID:      metadata.ClientID,
 		Scopes:        metadata.Scopes,
+		Flow:          metadata.Flow,
+		Hostname:      metadata.Hostname,
 	}, nil
 }
 
@@ -114,6 +172,12 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 	if err := validateProfile(profile); err != nil {
 		return nil, err
 	}
+
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
 
 	// Use PAT flow if credentials are present (highest priority)
 	if HasPATCredentials() {
@@ -132,13 +196,143 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 	)
 
 	hostClient := m.p.hostClient(ctx)
-	fp := fingerprintHash(m.p.config.Hostname)
+	if hostClient == nil {
+		return nil, fmt.Errorf("not authenticated: host service not available")
+	}
+
+	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
+	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
+	metaKey, _ := profileSecretKey(SecretKeyMetadata, profile)
+
+	mu := m.p.profileLock(profile)
+	mu.RLock()
+	refreshToken, refreshFound, refreshGetErr := hostClient.GetSecret(ctx, refreshKey)
+	if refreshGetErr != nil {
+		mu.RUnlock()
+		return nil, fmt.Errorf("failed to inspect refresh token: %w", refreshGetErr)
+	}
+	hasRefresh := refreshFound && refreshToken != ""
+
+	accessToken, accessFound, accessGetErr := hostClient.GetSecret(ctx, accessKey)
+	if accessGetErr != nil {
+		mu.RUnlock()
+		return nil, fmt.Errorf("failed to inspect access token: %w", accessGetErr)
+	}
+	hasAccess := accessFound && accessToken != ""
+
+	metaRaw, metaFound, metaGetErr := hostClient.GetSecret(ctx, metaKey)
+	var metadata *TokenMetadata
+	var metaParseErr error
+	if metaGetErr == nil && metaFound {
+		var parsed TokenMetadata
+		if uErr := decodeMetadata(metaRaw, &parsed); uErr != nil {
+			metaParseErr = uErr
+		} else {
+			metadata = &parsed
+		}
+	}
+
+	if metaGetErr != nil {
+		mu.RUnlock()
+		return nil, fmt.Errorf("failed to inspect session metadata: %w", metaGetErr)
+	}
+	if metaParseErr != nil {
+		mu.RUnlock()
+		return nil, fmt.Errorf("failed to load metadata: %w", metaParseErr)
+	}
+
+	sessionCfg, hostErr := resolveSessionConfig(cfg, metadata)
+	if hostErr != nil {
+		mu.RUnlock()
+		var mismatch *hostnameMismatchError
+		if errors.As(hostErr, &mismatch) {
+			return nil, fmt.Errorf("not authenticated for hostname %q: %w", cfg.Hostname, hostErr)
+		}
+		return nil, fmt.Errorf("not authenticated: %w", hostErr)
+	}
+	ctx = withResolvedConfig(ctx, sessionCfg)
+
+	fp := fingerprintHash(sessionCfg.Hostname)
 	cacheKey := fp + ":" + defaultCacheKey
 
-	// Check cache first (unless force refresh)
-	if !req.ForceRefresh && hostClient != nil {
-		token, err := cacheGet(ctx, hostClient, cacheKey, profile)
-		if err == nil && token != nil && token.IsValidFor(minValidFor) {
+	// Handle GitHub App sessions (including legacy service-principal metadata
+	// that omitted Flow/AccessTokenExpiresAt) explicitly so 1-hour installation
+	// tokens are never wrapped with a 365-day farFuture() expiry.
+	if isGitHubAppSession(metadata) {
+		if !hasAccess {
+			mu.RUnlock()
+			return nil, fmt.Errorf("not authenticated: GitHub App installation token not found, please re-authenticate with '%s auth login github --flow github_app'", m.p.binaryName())
+		}
+		if metadata.Flow != auth.FlowGitHubApp || metadata.AccessTokenExpiresAt.IsZero() {
+			mu.RUnlock()
+			return nil, fmt.Errorf("not authenticated: legacy GitHub App session is missing expiration metadata, please re-authenticate with '%s auth login github --flow github_app'", m.p.binaryName())
+		}
+		appID := metadata.AppID
+		if appID == 0 {
+			appID = sessionCfg.GetAppID()
+		}
+		installID := metadata.InstallationID
+		if installID == 0 {
+			installID = sessionCfg.GetInstallationID()
+		}
+		appCacheKey := fingerprintHash(fmt.Sprintf("%s:%d:%d", sessionCfg.Hostname, appID, installID)) + ":" + installationTokenCacheKey
+
+		if !req.ForceRefresh {
+			cached, cErr := cacheGet(ctx, hostClient, appCacheKey, profile)
+			if cErr == nil && cached != nil &&
+				(metadata.SessionID == "" || cached.SessionID == metadata.SessionID) &&
+				cached.IsValidFor(minValidFor) {
+				mu.RUnlock()
+				return &sdkplugin.TokenResponse{
+					AccessToken: cached.AccessToken,
+					TokenType:   cached.TokenType,
+					ExpiresAt:   cached.ExpiresAt,
+					Scope:       cached.Scope,
+					Flow:        auth.FlowGitHubApp,
+					SessionID:   cached.SessionID,
+				}, nil
+			}
+			if hasAccess && !metadata.AccessTokenExpiresAt.IsZero() &&
+				time.Until(metadata.AccessTokenExpiresAt) >= minValidFor {
+				resp := &sdkplugin.TokenResponse{
+					AccessToken: accessToken,
+					TokenType:   "Bearer",
+					ExpiresAt:   metadata.AccessTokenExpiresAt,
+					Flow:        auth.FlowGitHubApp,
+					SessionID:   metadata.SessionID,
+				}
+				mu.RUnlock()
+				return resp, nil
+			}
+		}
+		mu.RUnlock()
+
+		// Re-mint a fresh GitHub App installation token once if credentials are
+		// available, pinning renewal to the reconciled stored (appID, installID)
+		// and guarding the commit against concurrent Logout/Login.
+		if sessionCfg.ValidateAppConfig(ctx, lgr, hostClient) == nil {
+			minted, renewErr := m.p.renewAppInstallationToken(ctx, metadata.SessionID, appID, installID)
+			if renewErr != nil {
+				return nil, renewErr
+			}
+			if time.Until(minted.ExpiresAt) < minValidFor {
+				return nil, fmt.Errorf(
+					"freshly minted GitHub App installation token expires in %s, which is shorter than requested minimum validity %s",
+					time.Until(minted.ExpiresAt).Round(time.Second),
+					minValidFor,
+				)
+			}
+			return minted, nil
+		}
+		return nil, fmt.Errorf("GitHub App installation token expired, please re-authenticate with '%s auth login github --flow github_app'", m.p.binaryName())
+	}
+
+	// Check cache first (unless force refresh) under profile read lock.
+	if !req.ForceRefresh && (hasRefresh || hasAccess) {
+		token, cErr := cacheGet(ctx, hostClient, cacheKey, profile)
+		sessionMatches := metadata == nil || metadata.SessionID == "" || token == nil || token.SessionID == metadata.SessionID
+		if cErr == nil && token != nil && sessionMatches && token.IsValidFor(minValidFor) {
+			mu.RUnlock()
 			lgr.V(1).Info("using cached token",
 				"expiresAt", token.ExpiresAt,
 				"remainingValidity", token.TimeUntilExpiry(),
@@ -152,48 +346,57 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 				SessionID:   token.SessionID,
 			}, nil
 		}
-		if err != nil {
-			lgr.V(1).Info("cache lookup failed, will mint new token", "error", err)
-		} else if token != nil {
-			lgr.V(1).Info("cached token insufficient validity",
-				"expiresAt", token.ExpiresAt,
-				"remainingValidity", token.TimeUntilExpiry(),
-				"requiredValidity", minValidFor,
-			)
-		}
 	}
 
-	// Check if we have a stored access token (non-expiring OAuth App)
-	accessToken, err := m.p.loadAccessToken(ctx)
-	if err == nil && accessToken != "" {
+	// Check if we have a stored non-expiring OAuth App access token (only when
+	// no refresh token is stored for this profile).
+	if !hasRefresh && hasAccess {
+		var sessionID string
+		var flow auth.Flow
+		if metadata != nil {
+			sessionID = metadata.SessionID
+			flow = metadata.Flow
+		}
+		mu.RUnlock()
+
 		token := &auth.Token{
 			AccessToken: accessToken,
 			TokenType:   "Bearer",
 			ExpiresAt:   farFuture(),
+			Flow:        flow,
+			SessionID:   sessionID,
 		}
-		if hostClient != nil {
+
+		// Re-acquire write lock and verify session continuity before populating cache.
+		mu.Lock()
+		curRefresh, curRefFound, curRefErr := hostClient.GetSecret(ctx, refreshKey)
+		stillSame := curRefErr == nil && (!curRefFound || curRefresh == "")
+		if stillSame {
+			curAccess, curFound, curErr := hostClient.GetSecret(ctx, accessKey)
+			stillSame = curErr == nil && curFound && curAccess == accessToken
+		}
+		if stillSame {
 			if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
 				lgr.V(1).Info("failed to cache token", "error", cacheErr)
 			}
 		}
+		mu.Unlock()
+
 		return &sdkplugin.TokenResponse{
 			AccessToken: token.AccessToken,
 			TokenType:   token.TokenType,
 			ExpiresAt:   token.ExpiresAt,
+			Flow:        token.Flow,
+			SessionID:   token.SessionID,
 		}, nil
 	}
+	mu.RUnlock()
 
-	// Try to mint new token using refresh token
-	token, err := m.p.mintToken(ctx)
+	// Coalesce concurrent OAuth refreshes per profile so expired-cache callers
+	// do not submit the same single-use refresh token in parallel.
+	token, err := m.p.mintTokenCoalesced(ctx, req.ForceRefresh, minValidFor)
 	if err != nil {
 		return nil, err
-	}
-
-	// Cache the token
-	if hostClient != nil {
-		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
-			lgr.V(1).Info("failed to cache token", "error", cacheErr)
-		}
 	}
 
 	return &sdkplugin.TokenResponse{
@@ -214,14 +417,31 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 		return nil, fmt.Errorf("host service not available")
 	}
 
-	var results []*auth.CachedTokenInfo
-
 	profile := auth.ProfileFromContext(ctx)
 	if err := validateProfile(profile); err != nil {
 		return nil, err
 	}
 
-	// Refresh token (device code flow with token expiry enabled)
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []*auth.CachedTokenInfo
+
+	mu := m.p.profileLock(profile)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	metadata, metaErr := m.p.loadMetadataUnlocked(ctx)
+	sessionCfg := cfg
+	if metaErr == nil && metadata != nil {
+		if resolved, rErr := resolveSessionConfig(cfg, metadata); rErr == nil {
+			sessionCfg = resolved
+		}
+	}
+
+	// Refresh token (device code / interactive flow with token expiry enabled)
 	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
 	if m.p.secretExists(ctx, refreshKey) {
 		info := &auth.CachedTokenInfo{
@@ -229,7 +449,7 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 			TokenKind: "refresh",
 			Flow:      auth.FlowDeviceCode,
 		}
-		if metadata, err := m.p.loadMetadata(ctx); err == nil && metadata != nil {
+		if metaErr == nil && metadata != nil {
 			info.ExpiresAt = metadata.RefreshTokenExpiresAt
 			info.CachedAt = metadata.LastRefresh
 			info.SessionID = metadata.SessionID
@@ -247,10 +467,10 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 	entries, _ := cacheListEntries(ctx, hostClient, profile)
 	results = append(results, entries...)
 
-	// Direct access token not in cache
+	// Direct access token not yet represented in the token cache
 	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
-	if m.p.secretExists(ctx, accessKey) {
-		fp := fingerprintHash(m.p.config.Hostname)
+	if len(entries) == 0 && m.p.secretExists(ctx, accessKey) {
+		fp := fingerprintHash(sessionCfg.Hostname)
 		cacheKey := fp + ":" + defaultCacheKey
 		cached, cacheErr := cacheGet(ctx, hostClient, cacheKey, profile)
 		if cacheErr != nil || cached == nil {
@@ -259,10 +479,14 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 				TokenKind: "access",
 				TokenType: "Bearer",
 			}
-			if metadata, err := m.p.loadMetadata(ctx); err == nil && metadata != nil {
+			if metaErr == nil && metadata != nil {
 				info.CachedAt = metadata.LastRefresh
 				info.SessionID = metadata.SessionID
 				info.Flow = metadata.Flow
+				info.ExpiresAt = metadata.AccessTokenExpiresAt
+				if !info.ExpiresAt.IsZero() {
+					info.IsExpired = time.Now().After(info.ExpiresAt)
+				}
 			}
 			results = append(results, info)
 		}
@@ -283,12 +507,25 @@ func (m *cliMode) PurgeExpiredTokens(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	mu := m.p.profileLock(profile)
+	mu.Lock()
+	defer mu.Unlock()
+
 	return cachePurgeExpired(ctx, hostClient, profile)
 }
 
 // DetectAvailableFlows reports which auth flows are available based on
 // environment credentials or configuration in CLI mode.
-func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvailability, error) {
+func (m *cliMode) DetectAvailableFlows(ctx context.Context) ([]sdkplugin.FlowAvailability, error) {
+	if err := validateProfile(auth.ProfileFromContext(ctx)); err != nil {
+		return nil, err
+	}
+
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var flows []sdkplugin.FlowAvailability
 
 	// PAT flow -- check environment variables
@@ -311,9 +548,9 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 	}
 
 	// GitHub App flow -- check for app ID and private key indicators
-	hasAppID := m.p.config.GetAppID() != 0
-	hasPrivateKey := m.p.config.PrivateKey != "" || m.p.config.PrivateKeyPath != "" ||
-		m.p.config.PrivateKeySecretName != "" ||
+	hasAppID := cfg.GetAppID() != 0
+	hasPrivateKey := cfg.PrivateKey != "" || cfg.PrivateKeyPath != "" ||
+		cfg.PrivateKeySecretName != "" ||
 		os.Getenv(EnvGitHubAppPrivateKey) != "" ||
 		os.Getenv(EnvGitHubAppPrivateKeyPath) != ""
 

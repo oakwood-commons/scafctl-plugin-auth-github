@@ -5,6 +5,7 @@ package github
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"os"
 	"time"
@@ -21,7 +22,6 @@ const (
 
 	// EnvGHToken is the environment variable used by the GitHub CLI (gh).
 	EnvGHToken = "GH_TOKEN" //nolint:gosec // env var name, not a credential
-
 )
 
 // GetPATFromEnv retrieves a personal access token from environment variables.
@@ -42,6 +42,16 @@ func HasPATCredentials() bool {
 func (p *Plugin) patLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting PAT login", "handler", HandlerName)
+
+	if err := validateProfile(auth.ProfileFromContext(ctx)); err != nil {
+		return nil, err
+	}
+
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
 
 	token := GetPATFromEnv()
 	if token == "" {
@@ -70,6 +80,12 @@ func (p *Plugin) patLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdk
 
 // patStatus returns auth status when PAT credentials are present.
 func (p *Plugin) patStatus(ctx context.Context) (*auth.Status, error) {
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	token := GetPATFromEnv()
 	if token == "" {
 		return &auth.Status{Authenticated: false}, nil
@@ -84,12 +100,25 @@ func (p *Plugin) patStatus(ctx context.Context) (*auth.Status, error) {
 		Authenticated: true,
 		Claims:        claims,
 		IdentityType:  auth.IdentityTypeUser,
-		Scopes:        p.config.DefaultScopes,
+		Scopes:        cfg.DefaultScopes,
+		Flow:          auth.FlowPAT,
+		Hostname:      cfg.Hostname,
 	}, nil
 }
 
 // getPATToken returns a token from the PAT environment variable.
 func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
+		return nil, err
+	}
+
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	token := GetPATFromEnv()
 	if token == "" {
 		return nil, fmt.Errorf("personal access token not configured: set %s or %s environment variable",
@@ -97,17 +126,16 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 	}
 
 	hostClient := p.hostClient(ctx)
-	profile := auth.ProfileFromContext(ctx)
 
-	// Use hostname-based cache key to avoid passing the raw token through
-	// more code paths than necessary.
-	fp := fingerprintHash(p.config.Hostname)
+	// Include a one-way SHA-256 digest over both hostname and token so rotating
+	// GITHUB_TOKEN / GH_TOKEN in the environment never hits a stale cache entry.
+	fp := fingerprintHash(cfg.Hostname + "\x00" + token)
 	cacheKey := fp + ":pat:" + defaultCacheKey
 
 	// Check cache unless force refresh
 	if !req.ForceRefresh && hostClient != nil {
 		cached, err := cacheGet(ctx, hostClient, cacheKey, profile)
-		if err == nil && cached != nil {
+		if err == nil && cached != nil && subtle.ConstantTimeCompare([]byte(cached.AccessToken), []byte(token)) == 1 {
 			minValidFor := req.MinValidFor
 			if minValidFor == 0 {
 				minValidFor = auth.DefaultMinValidFor
@@ -126,8 +154,7 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 	}
 
 	// Validate the PAT
-	_, err := p.fetchUserClaims(ctx, token)
-	if err != nil {
+	if _, err := p.fetchUserClaims(ctx, token); err != nil {
 		return nil, fmt.Errorf("PAT validation failed: %w", err)
 	}
 
