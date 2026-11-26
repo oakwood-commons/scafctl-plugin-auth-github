@@ -28,12 +28,22 @@ func (p *Plugin) fetchUserClaims(ctx context.Context, accessToken string) (*auth
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("fetching user claims from GitHub API")
 
-	endpoint := fmt.Sprintf("%s/user", p.config.GetAPIBaseURL())
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, releaseHTTP, err := p.acquireHTTPClient(ctx, cfg, true)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHTTP()
+
+	endpoint := fmt.Sprintf("%s/user", cfg.GetAPIBaseURL())
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", accessToken),
 	}
 
-	resp, err := p.httpClient.Get(ctx, endpoint, headers)
+	resp, err := httpClient.Get(ctx, endpoint, headers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch user info: %w", err)
 	}
@@ -48,19 +58,23 @@ func (p *Plugin) fetchUserClaims(ctx context.Context, accessToken string) (*auth
 		return nil, fmt.Errorf("failed to parse user response: %w", err)
 	}
 
+	login := sanitizeControlChars(user.Login)
+	name := sanitizeControlChars(user.Name)
+	email := sanitizeControlChars(user.Email)
+
 	lgr.V(1).Info("user claims fetched",
-		"login", user.Login,
-		"name", user.Name,
+		"login", login,
+		"name", name,
 		"id", user.ID,
 	)
 
 	return &auth.Claims{
-		Issuer:   p.config.Hostname,
-		Subject:  user.Login,
+		Issuer:   cfg.Hostname,
+		Subject:  login,
 		ObjectID: strconv.FormatInt(user.ID, 10),
-		Email:    user.Email,
-		Name:     user.Name,
-		Username: user.Login,
+		Email:    email,
+		Name:     name,
+		Username: login,
 		IssuedAt: time.Now(),
 	}, nil
 }

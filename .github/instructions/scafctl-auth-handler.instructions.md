@@ -10,11 +10,12 @@ Use this guidance when editing auth-handler plugin code.
 ## Method Responsibilities
 
 - `GetAuthHandlers` describes the handler contract: name, display name, flows, and capabilities.
-- `ConfigureAuthHandler` stores host configuration for later use.
-- `Login` performs the authentication flow and returns claims plus expiry data.
+- `ConfigureAuthHandler` stores host configuration (including `AuthCallbackPages` and baseline settings) for fallback use.
+- `Login` performs the authentication flow (honoring per-RPC `RequestSettingsFromContext`, `ProfileFromContext`, `Hostname`, `CallbackPort`, and `Browser`) and returns claims plus expiry data.
 - `GetStatus` reports current authentication state without side effects.
-- `GetToken` returns a usable token or a clear error.
-- `Logout`, `ListCachedTokens`, `PurgeExpiredTokens`, and `StopAuthHandler` should be safe and predictable.
+- `GetToken` returns a usable token or a clear error, isolating credentials and HTTP clients by profile and effective configuration.
+- `DetectAvailableFlows` reports flow availability for the effective per-RPC or configured settings.
+- `Logout`, `ListCachedTokens`, `PurgeExpiredTokens`, and `StopAuthHandler` should be safe, profile-aware, and predictable.
 
 ## Contract Rules
 

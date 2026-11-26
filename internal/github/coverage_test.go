@@ -9,11 +9,10 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
-	"testing"
-	"time"
-
 	"os"
 	"strings"
+	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/golang-jwt/jwt/v5"
@@ -315,6 +314,7 @@ func TestRefreshAccessToken_RotatesToken(t *testing.T) {
 	meta := &TokenMetadata{Claims: &auth.Claims{Subject: "user1"}, Hostname: DefaultHostname, ClientID: DefaultClientID, Scopes: []string{"repo"}, SessionID: "s1"}
 	metaBytes, _ := json.Marshal(meta)
 	hc := newFakeHostClient(fake)
+	require.NoError(t, hc.SetSecret(ctx, SecretKeyRefreshToken, "old_rt"))
 	require.NoError(t, hc.SetSecret(ctx, SecretKeyMetadata, string(metaBytes)))
 	tok, err := p.refreshAccessToken(ctx, "old_rt", "cid")
 	require.NoError(t, err)
@@ -869,7 +869,7 @@ func TestGetPrivateKey_Inline(t *testing.T) {
 func TestGetPrivateKey_FromFile(t *testing.T) {
 	t.Setenv(EnvGitHubAppPrivateKey, "")
 	tmpFile := t.TempDir() + "/key.pem"
-	require.NoError(t, os.WriteFile(tmpFile, []byte("file-pem-data"), 0600))
+	require.NoError(t, os.WriteFile(tmpFile, []byte("file-pem-data"), 0o600))
 	cfg := &Config{PrivateKeyPath: tmpFile}
 	key, err := cfg.GetPrivateKey(context.Background(), discardLogger(), nil)
 	require.NoError(t, err)
@@ -879,7 +879,7 @@ func TestGetPrivateKey_FromFile(t *testing.T) {
 func TestGetPrivateKey_FromFilePath_Env(t *testing.T) {
 	t.Setenv(EnvGitHubAppPrivateKey, "")
 	tmpFile := t.TempDir() + "/envkey.pem"
-	require.NoError(t, os.WriteFile(tmpFile, []byte("env-file-data"), 0600))
+	require.NoError(t, os.WriteFile(tmpFile, []byte("env-file-data"), 0o600))
 	t.Setenv(EnvGitHubAppPrivateKeyPath, tmpFile)
 	cfg := &Config{}
 	key, err := cfg.GetPrivateKey(context.Background(), discardLogger(), nil)

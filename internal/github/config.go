@@ -7,11 +7,16 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
+	"github.com/oakwood-commons/httpc"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
@@ -25,10 +30,11 @@ const DefaultHostname = "github.com"
 
 // Default HTTP client settings.
 const (
-	defaultHTTPTimeout        = 30 * time.Second
-	defaultHTTPRetryMax       = 3
-	defaultHTTPRetryWaitFloor = 1 * time.Second
-	defaultHTTPRetryWaitMax   = 10 * time.Second
+	defaultHTTPTimeout         = 30 * time.Second
+	defaultHTTPRetryMax        = 3
+	defaultHTTPRetryWaitFloor  = 1 * time.Second
+	defaultHTTPRetryWaitMax    = 10 * time.Second
+	defaultHTTPClientCacheSize = 32
 )
 
 // Config holds configuration for the GitHub auth handler.
@@ -45,6 +51,13 @@ type Config struct {
 
 	// DefaultScopes is the list of OAuth scopes to request by default.
 	DefaultScopes []string `json:"defaultScopes" yaml:"defaultScopes"`
+
+	// HTTPClient carries optional HTTP client settings forwarded by the host
+	// under auth.github.httpClient or profiles.<name>.httpClient. Nil keeps
+	// the plugin's defaults. HTTP response caching is always disabled on auth
+	// handler clients regardless of EnableCache to prevent cross-account
+	// response reuse.
+	HTTPClient *httpc.AppConfig `json:"httpClient,omitempty" yaml:"httpClient,omitempty"`
 
 	// MinPollInterval is the minimum polling interval for device code flow.
 	MinPollInterval time.Duration `json:"-" yaml:"-"`
@@ -67,6 +80,32 @@ type Config struct {
 	// PrivateKeySecretName is the name of the secret in the host secret store
 	// that contains the PEM-encoded private key.
 	PrivateKeySecretName string `json:"privateKeySecretName,omitempty" yaml:"privateKeySecretName,omitempty"`
+
+	// hasExplicitHostname records whether Hostname was explicitly configured
+	// (via handler/request JSON settings or per-RPC Hostname override) rather
+	// than defaulted to DefaultHostname.
+	hasExplicitHostname bool `json:"-" yaml:"-"`
+
+	// hasHostnameOverride records whether Hostname was explicitly set via a
+	// per-RPC request Hostname field (LoginRequest/StatusRequest/TokenRequest).
+	hasHostnameOverride bool `json:"-" yaml:"-"`
+}
+
+// clone returns an independent copy of c so per-RPC overrides never mutate a
+// shared Config instance.
+func (c *Config) clone() *Config {
+	if c == nil {
+		return DefaultConfig()
+	}
+	cp := *c
+	if c.DefaultScopes != nil {
+		cp.DefaultScopes = append([]string(nil), c.DefaultScopes...)
+	}
+	if c.HTTPClient != nil {
+		httpCopy := *c.HTTPClient
+		cp.HTTPClient = &httpCopy
+	}
+	return &cp
 }
 
 // DefaultConfig returns the default GitHub auth configuration.
@@ -79,24 +118,51 @@ func DefaultConfig() *Config {
 	}
 }
 
+// validateHostname checks that h is a safe host or host:port value with no
+// control characters, whitespace, or URL path/query/fragment/userinfo delimiters.
+func validateHostname(h string) error {
+	if h == "" {
+		return fmt.Errorf("github auth: hostname is required")
+	}
+	if !utf8.ValidString(h) {
+		return fmt.Errorf("github auth: hostname contains invalid characters")
+	}
+	for _, r := range h {
+		if r <= 0x20 || r == 0x7f || unicode.IsSpace(r) || unicode.IsControl(r) ||
+			r == 0x061c || r == 0x200e || r == 0x200f ||
+			(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
+			return fmt.Errorf("github auth: hostname contains invalid characters")
+		}
+	}
+	if strings.ContainsAny(h, ";\"'/\\?#@%") {
+		return fmt.Errorf("github auth: hostname contains invalid characters")
+	}
+	if strings.Contains(h, ":") || strings.HasPrefix(h, "[") || strings.HasSuffix(h, "]") {
+		host, portStr, err := net.SplitHostPort(h)
+		if err != nil {
+			return fmt.Errorf("github auth: hostname contains invalid characters")
+		}
+		if host == "" {
+			return fmt.Errorf("github auth: hostname is empty")
+		}
+		port, pErr := strconv.Atoi(portStr)
+		if pErr != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("github auth: hostname has invalid port")
+		}
+	}
+	u, err := url.Parse("https://" + h)
+	if err != nil || u.Host != h || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("github auth: hostname contains invalid characters")
+	}
+	return nil
+}
+
 // Validate checks the configuration for required fields.
 func (c *Config) Validate() error {
 	if c.ClientID == "" {
 		return fmt.Errorf("github auth: client ID is required")
 	}
-	if c.Hostname == "" {
-		return fmt.Errorf("github auth: hostname is required")
-	}
-	// Reject hostnames with characters that could cause malformed URLs.
-	if strings.ContainsAny(c.Hostname, " \t\n\r;\"'") {
-		return fmt.Errorf("github auth: hostname contains invalid characters")
-	}
-	if host, _, err := net.SplitHostPort(c.Hostname); err == nil {
-		if host == "" {
-			return fmt.Errorf("github auth: hostname is empty")
-		}
-	}
-	return nil
+	return validateHostname(c.Hostname)
 }
 
 // GetOAuthBaseURL returns the base URL for GitHub OAuth endpoints.
@@ -244,7 +310,7 @@ type CredentialConfig struct {
 
 // PATCredentialConfig holds the PAT credential reference.
 type PATCredentialConfig struct {
-	// Token is a SecretRef pointing to the PAT value (env://... or file://...).
+	// Token is a SecretRef pointing to the PAT value (env://..., file://..., or secret://...).
 	Token sdkplugin.SecretRef `json:"token"`
 }
 
@@ -265,6 +331,11 @@ type AppCredentialConfig struct {
 
 // Validate checks the ServerConfig for required fields.
 func (sc *ServerConfig) Validate() error {
+	if sc.Hostname != "" {
+		if err := validateHostname(sc.Hostname); err != nil {
+			return err
+		}
+	}
 	if sc.ServerFlow == "" {
 		return fmt.Errorf("serverFlow is required")
 	}
@@ -299,8 +370,13 @@ func (sc *ServerConfig) Validate() error {
 			return fmt.Errorf("credential.app.privateKey: %w", err)
 		}
 
-		if _, err := cc.App.PrivateKey.Resolve(); err != nil {
-			return fmt.Errorf("resolving private key: %w", err)
+		// Eagerly verify env:// and file:// references during Validate();
+		// secret:// references require a HostServiceClient and are verified in
+		// activateServerMode.
+		if cc.App.PrivateKey.Scheme() != "secret" {
+			if _, err := cc.App.PrivateKey.Resolve(); err != nil {
+				return fmt.Errorf("resolving private key: %w", err)
+			}
 		}
 	}
 	return nil

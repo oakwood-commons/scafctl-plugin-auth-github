@@ -92,7 +92,7 @@ func createServerAppJWT(issuer string, privateKey *rsa.PrivateKey) (string, erro
 
 // serverInstallationFlow returns a FlowFn that mints a GitHub App installation token
 // using the standalone AppCredentialConfig with SecretRef for the private key.
-func serverInstallationFlow(app *AppCredentialConfig, apiBaseURL string, httpClient HTTPClient) FlowFn {
+func serverInstallationFlow(app *AppCredentialConfig, apiBaseURL string, httpClient HTTPClient, hostClient *sdkplugin.HostServiceClient) FlowFn {
 	return func(ctx context.Context, _ FlowParams) (*sdkplugin.TokenResponse, error) {
 		lgr := logr.FromContextOrDiscard(ctx)
 
@@ -102,7 +102,11 @@ func serverInstallationFlow(app *AppCredentialConfig, apiBaseURL string, httpCli
 			issuer = fmt.Sprintf("%d", app.AppID)
 		}
 
-		keyPEM, err := app.PrivateKey.Resolve()
+		hc := sdkplugin.HostClientFromContext(ctx)
+		if hc == nil {
+			hc = hostClient
+		}
+		keyPEM, err := app.PrivateKey.ResolveWithHost(ctx, hc)
 		if err != nil {
 			return nil, fmt.Errorf("resolving private key: %w", err)
 		}
@@ -194,13 +198,22 @@ func (p *Plugin) activateServerMode(ctx context.Context, sc *ServerConfig) error
 	lgr := logr.FromContextOrDiscard(ctx)
 	strategies := make(map[auth.ServerContext]FlowFn)
 
+	p.mu.RLock()
 	httpClient := p.httpClient
+	p.mu.RUnlock()
+
+	var createdServerHTTP *DefaultHTTPClient
 	if httpClient == nil {
-		httpClient = NewDefaultHTTPClient(logr.FromContextOrDiscard(ctx))
+		createdServerHTTP = NewDefaultHTTPClient(lgr.V(5))
+		httpClient = createdServerHTTP
 	}
 
-	serverFlowFn, err := buildServerFlowFn(sc.ServerFlow, &sc.Credential, sc.GetAPIBaseURL(), httpClient)
+	hostClient := p.hostClient(ctx)
+	serverFlowFn, err := buildServerFlowFn(ctx, sc.ServerFlow, &sc.Credential, sc.GetAPIBaseURL(), httpClient, hostClient)
 	if err != nil {
+		if createdServerHTTP != nil {
+			_ = createdServerHTTP.Close()
+		}
 		return fmt.Errorf("server flow: %w", err)
 	}
 
@@ -213,7 +226,7 @@ func (p *Plugin) activateServerMode(ctx context.Context, sc *ServerConfig) error
 
 	strategies[auth.ServerContextServer] = serverFlowFn
 
-	// Delegated flow — uses the same (cached) server credential
+	// Delegated flow -- uses the same (cached) server credential
 	if sc.Delegated {
 		lgr.V(1).Info("delegated mode enabled, reusing server credential")
 		strategies[auth.ServerContextDelegated] = serverFlowFn
@@ -225,22 +238,39 @@ func (p *Plugin) activateServerMode(ctx context.Context, sc *ServerConfig) error
 		"delegated", sc.Delegated,
 	)
 
+	p.clientCacheMu.Lock()
+	p.cacheStopped = false
+	p.clientCacheMu.Unlock()
+
+	var prevSrvHTTP *DefaultHTTPClient
+	p.mu.Lock()
 	p.mode = &githubServerMode{strategies: strategies, cacheManager: mgr}
+	if createdServerHTTP != nil {
+		prevSrvHTTP = p.serverModeHTTP
+		p.serverModeHTTP = createdServerHTTP
+	}
+	p.mu.Unlock()
+
+	if prevSrvHTTP != nil {
+		_ = prevSrvHTTP.Close()
+	}
 	return nil
 }
 
 // buildServerFlowFn returns the appropriate FlowFn based on the server flow.
-func buildServerFlowFn(serverFlow auth.Flow, cc *CredentialConfig, apiBaseURL string, httpClient HTTPClient) (FlowFn, error) {
+func buildServerFlowFn(ctx context.Context, serverFlow auth.Flow, cc *CredentialConfig, apiBaseURL string, httpClient HTTPClient, hostClient *sdkplugin.HostServiceClient) (FlowFn, error) {
 	switch serverFlow {
 	case auth.FlowPAT:
-		// Resolve eagerly — PAT is a static secret, fail fast if missing.
-		val, err := cc.PAT.Token.Resolve()
+		// Resolve eagerly -- PAT is a static secret, fail fast if missing.
+		val, err := cc.PAT.Token.ResolveWithHost(ctx, hostClient)
 		if err != nil {
 			return nil, fmt.Errorf("resolving PAT: %w", err)
 		}
 		return patFlow(val), nil
 	case auth.FlowGitHubApp:
-		return serverInstallationFlow(cc.App, apiBaseURL, httpClient), nil
+		// Private key is resolved per-mint inside serverInstallationFlow (supporting
+		// key rotation and secret:// references via hostClient).
+		return serverInstallationFlow(cc.App, apiBaseURL, httpClient, hostClient), nil
 	default:
 		return nil, fmt.Errorf("unsupported server flow: %s", serverFlow)
 	}
