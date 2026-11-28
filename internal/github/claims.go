@@ -6,13 +6,28 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 )
+
+type githubAPIStatusError struct {
+	statusCode int
+}
+
+func (e *githubAPIStatusError) Error() string {
+	return fmt.Sprintf("GitHub API returned status %d", e.statusCode)
+}
+
+func isUnauthorizedStatusError(err error) bool {
+	var statusErr *githubAPIStatusError
+	return errors.As(err, &statusErr) && statusErr.statusCode == http.StatusUnauthorized
+}
 
 // User represents the relevant fields from the GitHub /user API response.
 type User struct {
@@ -49,8 +64,8 @@ func (p *Plugin) fetchUserClaims(ctx context.Context, accessToken string) (*auth
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		return nil, &githubAPIStatusError{statusCode: resp.StatusCode}
 	}
 
 	var user User

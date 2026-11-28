@@ -58,6 +58,7 @@ type TokenErrorResponse struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
 	ErrorURI         string `json:"error_uri,omitempty"`
+	Interval         int    `json:"interval,omitempty"`
 }
 
 // mintToken creates a new access token using the refresh token.
@@ -114,8 +115,7 @@ func (p *Plugin) mintTokenCoalesced(ctx context.Context, forceRefresh bool, minV
 		return nil, fmt.Errorf("not authenticated: %w", hostErr)
 	}
 
-	fp := fingerprintHash(sessionCfg.Hostname)
-	cacheKey := fp + ":" + defaultCacheKey
+	cacheKey := sessionTokenCacheKey(sessionCfg.Hostname)
 
 	if !forceRefresh && hostClient != nil {
 		cached, cErr := cacheGet(ctx, hostClient, cacheKey, profile)
@@ -357,6 +357,9 @@ func (p *Plugin) storeCredentials(ctx context.Context, tokenResp *TokenResponse,
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		if isUnauthorizedStatusError(err) {
+			return nil, fmt.Errorf("access token validation failed: %w", err)
+		}
 		claims = &auth.Claims{
 			Issuer: cfg.Hostname,
 		}
@@ -390,13 +393,18 @@ func (p *Plugin) storeCredentialsLocked(
 		refreshTokenExpiresAt = time.Now().Add(time.Duration(tokenResp.RefreshTokenExpiresIn) * time.Second)
 	}
 
+	clientID := cfg.ClientID
+	if flow == auth.FlowPAT {
+		clientID = ""
+	}
+
 	metadata := &TokenMetadata{
 		Claims:                claims,
 		RefreshTokenExpiresAt: refreshTokenExpiresAt,
 		LastRefresh:           time.Now(),
 		Hostname:              cfg.Hostname,
 		HostnameOverride:      cfg.hasHostnameOverride,
-		ClientID:              cfg.ClientID,
+		ClientID:              clientID,
 		Scopes:                scopes,
 		IdentityType:          string(auth.IdentityTypeUser),
 		SessionID:             sessionID,
@@ -448,8 +456,7 @@ func (p *Plugin) storeCredentialsLocked(
 		return nil, fmt.Errorf("failed to inspect existing metadata: %w", prevMetaErr)
 	}
 
-	fp := fingerprintHash(cfg.Hostname)
-	cacheKey := fp + ":" + defaultCacheKey
+	cacheKey := sessionTokenCacheKey(cfg.Hostname)
 
 	rollbackSecrets := func(mutatedRefresh, wroteAccess, wroteMeta, wroteCache bool) {
 		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
@@ -530,7 +537,7 @@ func (p *Plugin) storeCredentialsLocked(
 		} else if tokenResp.RefreshToken != "" {
 			expiresAt = time.Now().Add(8 * time.Hour)
 		} else {
-			expiresAt = farFuture() // truly non-expiring OAuth App token
+			expiresAt = farFuture() // non-expiring PAT or OAuth App token without refresh token
 		}
 		cacheScope := tokenResp.Scope
 		if cacheScope == "" {

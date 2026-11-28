@@ -190,8 +190,7 @@ func (p *Plugin) appLogin(ctx context.Context) (*sdkplugin.LoginResponse, error)
 			return nil, fmt.Errorf("github: store_metadata: failed to inspect existing metadata: %w", prevMetaErr)
 		}
 
-		appFingerprint := fingerprintHash(fmt.Sprintf("%s:%d:%d", acq.cfg.Hostname, acq.appID, acq.installationID))
-		cacheKey := appFingerprint + ":" + installationTokenCacheKey
+		cacheKey := appTokenCacheKey(acq.cfg.Hostname, acq.appID, acq.installationID)
 
 		rollbackAppSecrets := func(removedRefresh, wroteAccess, wroteMeta, wroteCache bool) {
 			cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
@@ -357,8 +356,7 @@ func (p *Plugin) renewAppInstallationToken(ctx context.Context, expectedSessionI
 		Flow:        auth.FlowGitHubApp,
 		SessionID:   expectedSessionID,
 	}
-	appFingerprint := fingerprintHash(fmt.Sprintf("%s:%d:%d", acq.cfg.Hostname, acq.appID, acq.installationID))
-	cacheKey := appFingerprint + ":" + installationTokenCacheKey
+	cacheKey := appTokenCacheKey(acq.cfg.Hostname, acq.appID, acq.installationID)
 	if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
 		lgr.V(1).Info("failed to cache installation token", "error", cacheErr)
 	}

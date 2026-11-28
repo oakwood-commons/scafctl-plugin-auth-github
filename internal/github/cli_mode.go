@@ -5,9 +5,11 @@ package github
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -252,8 +254,7 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 	}
 	ctx = withResolvedConfig(ctx, sessionCfg)
 
-	fp := fingerprintHash(sessionCfg.Hostname)
-	cacheKey := fp + ":" + defaultCacheKey
+	cacheKey := sessionTokenCacheKey(sessionCfg.Hostname)
 
 	// Handle GitHub App sessions (including legacy service-principal metadata
 	// that omitted Flow/AccessTokenExpiresAt) explicitly so 1-hour installation
@@ -275,7 +276,7 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 		if installID == 0 {
 			installID = sessionCfg.GetInstallationID()
 		}
-		appCacheKey := fingerprintHash(fmt.Sprintf("%s:%d:%d", sessionCfg.Hostname, appID, installID)) + ":" + installationTokenCacheKey
+		appCacheKey := appTokenCacheKey(sessionCfg.Hostname, appID, installID)
 
 		if !req.ForceRefresh {
 			cached, cErr := cacheGet(ctx, hostClient, appCacheKey, profile)
@@ -348,37 +349,58 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 		}
 	}
 
-	// Check if we have a stored non-expiring OAuth App access token (only when
-	// no refresh token is stored for this profile).
+	// Check if we have a stored non-expiring access token (such as a persisted PAT
+	// or OAuth App token without a refresh token for this profile).
 	if !hasRefresh && hasAccess {
+		hadMeta := metadata != nil
 		var sessionID string
 		var flow auth.Flow
+		var scope string
 		if metadata != nil {
 			sessionID = metadata.SessionID
 			flow = metadata.Flow
+			scope = strings.Join(metadata.Scopes, " ")
 		}
 		mu.RUnlock()
+
+		if req.ForceRefresh {
+			if _, err := m.p.fetchUserClaims(ctx, accessToken); err != nil {
+				var cleanupErr error
+				if isUnauthorizedStatusError(err) {
+					cleanupErr = m.p.invalidateRejectedAccessToken(ctx, hostClient, profile, refreshKey, accessKey, metaKey, accessToken, hadMeta, sessionID, metaRaw)
+				}
+				var authErr error
+				if flow == auth.FlowPAT {
+					authErr = fmt.Errorf("not authenticated: PAT validation failed: %w", err)
+				} else {
+					authErr = fmt.Errorf("not authenticated: access token validation failed: %w", err)
+				}
+				if cleanupErr != nil {
+					return nil, errors.Join(authErr, cleanupErr)
+				}
+				return nil, authErr
+			}
+		}
 
 		token := &auth.Token{
 			AccessToken: accessToken,
 			TokenType:   "Bearer",
 			ExpiresAt:   farFuture(),
+			Scope:       scope,
 			Flow:        flow,
 			SessionID:   sessionID,
 		}
 
-		// Re-acquire write lock and verify session continuity before populating cache.
+		// Re-acquire write lock and verify session continuity before caching or
+		// returning the credential so concurrent Logout or replacement Login wins.
 		mu.Lock()
-		curRefresh, curRefFound, curRefErr := hostClient.GetSecret(ctx, refreshKey)
-		stillSame := curRefErr == nil && (!curRefFound || curRefresh == "")
-		if stillSame {
-			curAccess, curFound, curErr := hostClient.GetSecret(ctx, accessKey)
-			stillSame = curErr == nil && curFound && curAccess == accessToken
+		same, contErr := m.p.sameNonRefreshSessionLocked(ctx, hostClient, refreshKey, accessKey, metaKey, accessToken, hadMeta, sessionID, metaRaw)
+		if !same {
+			mu.Unlock()
+			return nil, contErr
 		}
-		if stillSame {
-			if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
-				lgr.V(1).Info("failed to cache token", "error", cacheErr)
-			}
+		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token, profile); cacheErr != nil {
+			lgr.V(1).Info("failed to cache token", "error", cacheErr)
 		}
 		mu.Unlock()
 
@@ -386,6 +408,7 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 			AccessToken: token.AccessToken,
 			TokenType:   token.TokenType,
 			ExpiresAt:   token.ExpiresAt,
+			Scope:       token.Scope,
 			Flow:        token.Flow,
 			SessionID:   token.SessionID,
 		}, nil
@@ -470,8 +493,7 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 	// Direct access token not yet represented in the token cache
 	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
 	if len(entries) == 0 && m.p.secretExists(ctx, accessKey) {
-		fp := fingerprintHash(sessionCfg.Hostname)
-		cacheKey := fp + ":" + defaultCacheKey
+		cacheKey := sessionTokenCacheKey(sessionCfg.Hostname)
 		cached, cacheErr := cacheGet(ctx, hostClient, cacheKey, profile)
 		if cacheErr != nil || cached == nil {
 			info := &auth.CachedTokenInfo{
@@ -574,19 +596,123 @@ func (m *cliMode) DetectAvailableFlows(ctx context.Context) ([]sdkplugin.FlowAva
 		})
 	}
 
-	// Device code flow -- always available (uses built-in OAuth App client ID)
-	flows = append(flows, sdkplugin.FlowAvailability{
-		Flow:      auth.FlowDeviceCode,
-		Available: true,
-		Reason:    "device code flow is always available",
-	})
-
-	// Interactive flow -- always available
+	// Interactive flow -- listed ahead of device_code so bare login opens the browser by default
 	flows = append(flows, sdkplugin.FlowAvailability{
 		Flow:      auth.FlowInteractive,
 		Available: true,
 		Reason:    "interactive flow is always available",
 	})
 
+	// Device code flow -- always available for headless environments (uses built-in OAuth App client ID)
+	flows = append(flows, sdkplugin.FlowAvailability{
+		Flow:      auth.FlowDeviceCode,
+		Available: true,
+		Reason:    "device code flow is always available",
+	})
+
 	return flows, nil
+}
+
+type continuityReadError struct {
+	err error
+}
+
+func (e *continuityReadError) Error() string { return e.err.Error() }
+func (e *continuityReadError) Unwrap() error { return e.err }
+
+// sameNonRefreshSessionLocked verifies under profileLock that profile still holds
+// the exact non-refresh access-token session observed before releasing the lock.
+func (p *Plugin) sameNonRefreshSessionLocked(
+	ctx context.Context,
+	hostClient *sdkplugin.HostServiceClient,
+	refreshKey, accessKey, metaKey, expectedAccessToken string,
+	hadMeta bool,
+	expectedSessionID, expectedMetaRaw string,
+) (bool, error) {
+	curRefresh, curRefFound, curRefErr := hostClient.GetSecret(ctx, refreshKey)
+	if curRefErr != nil {
+		return false, &continuityReadError{err: fmt.Errorf("not authenticated: failed to verify refresh token continuity: %w", curRefErr)}
+	}
+	if curRefFound && curRefresh != "" {
+		return false, fmt.Errorf("not authenticated: session changed during token validation")
+	}
+
+	curAccess, curFound, curErr := hostClient.GetSecret(ctx, accessKey)
+	if curErr != nil {
+		return false, &continuityReadError{err: fmt.Errorf("not authenticated: failed to verify access token continuity: %w", curErr)}
+	}
+	if !curFound || curAccess == "" {
+		return false, fmt.Errorf("not authenticated: session ended during token validation")
+	}
+	if subtle.ConstantTimeCompare([]byte(curAccess), []byte(expectedAccessToken)) != 1 {
+		return false, fmt.Errorf("not authenticated: session changed during token validation")
+	}
+
+	curMetaRaw, curMetaFound, curMetaErr := hostClient.GetSecret(ctx, metaKey)
+	if curMetaErr != nil {
+		return false, &continuityReadError{err: fmt.Errorf("not authenticated: failed to verify session metadata continuity: %w", curMetaErr)}
+	}
+	if !hadMeta {
+		if curMetaFound {
+			return false, fmt.Errorf("not authenticated: session changed during token validation")
+		}
+		return true, nil
+	}
+	if !curMetaFound {
+		return false, fmt.Errorf("not authenticated: session ended during token validation")
+	}
+	var curMeta TokenMetadata
+	if uErr := decodeMetadata(curMetaRaw, &curMeta); uErr != nil {
+		return false, &continuityReadError{err: fmt.Errorf("not authenticated: failed to load metadata: %w", uErr)}
+	}
+	if expectedSessionID != "" {
+		if curMeta.SessionID != expectedSessionID {
+			return false, fmt.Errorf("not authenticated: session changed during token validation")
+		}
+	} else if curMetaRaw != expectedMetaRaw {
+		return false, fmt.Errorf("not authenticated: session changed during token validation")
+	}
+
+	return true, nil
+}
+
+// invalidateRejectedAccessToken clears stored credentials and cached tokens for
+// profile when forced /user validation returns HTTP 401, provided no concurrent
+// Logout or replacement Login superseded the rejected session while unlocked.
+func (p *Plugin) invalidateRejectedAccessToken(
+	ctx context.Context,
+	hostClient *sdkplugin.HostServiceClient,
+	profile, refreshKey, accessKey, metaKey, expectedAccessToken string,
+	hadMeta bool,
+	expectedSessionID, expectedMetaRaw string,
+) error {
+	cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
+	defer cleanupCancel()
+	cleanupCtx = auth.WithProfile(cleanupCtx, profile)
+
+	mu := p.profileLock(profile)
+	mu.Lock()
+	defer mu.Unlock()
+
+	same, contErr := p.sameNonRefreshSessionLocked(cleanupCtx, hostClient, refreshKey, accessKey, metaKey, expectedAccessToken, hadMeta, expectedSessionID, expectedMetaRaw)
+	if !same {
+		var readErr *continuityReadError
+		if errors.As(contErr, &readErr) {
+			return readErr.err
+		}
+		return nil
+	}
+
+	var errs []error
+	if clearErr := cacheClearErr(cleanupCtx, hostClient, profile); clearErr != nil {
+		errs = append(errs, fmt.Errorf("clearing rejected token cache: %w", clearErr))
+	}
+	if delErr := hostClient.DeleteSecret(cleanupCtx, accessKey); delErr != nil {
+		errs = append(errs, fmt.Errorf("deleting rejected access token: %w", delErr))
+	} else if hadMeta {
+		if metaDelErr := hostClient.DeleteSecret(cleanupCtx, metaKey); metaDelErr != nil {
+			errs = append(errs, fmt.Errorf("deleting rejected session metadata: %w", metaDelErr))
+		}
+	}
+	return errors.Join(errs...)
 }
