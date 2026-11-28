@@ -6,8 +6,10 @@ package github
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -38,20 +40,29 @@ func HasPATCredentials() bool {
 	return GetPATFromEnv() != ""
 }
 
-// patLogin validates a PAT by calling the GitHub API.
+// patLogin validates a PAT by calling the GitHub API and persists the validated
+// credential in the host secret store scoped to the active profile and target hostname.
 func (p *Plugin) patLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting PAT login", "handler", HandlerName)
 
-	if err := validateProfile(auth.ProfileFromContext(ctx)); err != nil {
+	profile := auth.ProfileFromContext(ctx)
+	if err := validateProfile(profile); err != nil {
 		return nil, err
 	}
 
+	ctx = withHostnameOverride(ctx, req.Hostname)
 	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 	ctx = withResolvedConfig(ctx, cfg)
+
+	if req.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
+		defer cancel()
+	}
 
 	token := GetPATFromEnv()
 	if token == "" {
@@ -59,14 +70,47 @@ func (p *Plugin) patLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdk
 			EnvGitHubToken, EnvGHToken)
 	}
 
+	hostClient := p.hostClient(ctx)
+	if hostClient == nil {
+		return nil, fmt.Errorf("cannot persist PAT credentials: host secret store is not available")
+	}
+
+	releaseSlot, slotErr := p.acquireRefreshSlot(ctx, "pat:"+profile)
+	if slotErr != nil {
+		return nil, slotErr
+	}
+	defer releaseSlot()
+
 	claims, err := p.fetchUserClaims(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("PAT authentication failed: %w", err)
 	}
 
+	mu := p.profileLock(profile)
+	mu.Lock()
+	persistedClaims, storeErr := p.storeCredentialsLocked(
+		ctx,
+		cfg,
+		hostClient,
+		profile,
+		&TokenResponse{
+			AccessToken: token,
+			TokenType:   "Bearer",
+		},
+		claims,
+		nil,
+		"",
+		auth.FlowPAT,
+		false,
+	)
+	mu.Unlock()
+	if storeErr != nil {
+		return nil, fmt.Errorf("cannot persist PAT credentials: %w", storeErr)
+	}
+
 	lgr.V(1).Info("PAT authentication successful",
-		"login", claims.Subject,
-		"name", claims.Name,
+		"login", persistedClaims.Subject,
+		"name", persistedClaims.Name,
 	)
 
 	if len(req.Scopes) > 0 {
@@ -74,7 +118,7 @@ func (p *Plugin) patLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdk
 	}
 
 	return &sdkplugin.LoginResponse{
-		Claims: claims,
+		Claims: persistedClaims,
 	}, nil
 }
 
@@ -127,35 +171,63 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 
 	hostClient := p.hostClient(ctx)
 
-	// Include a one-way SHA-256 digest over both hostname and token so rotating
-	// GITHUB_TOKEN / GH_TOKEN in the environment never hits a stale cache entry.
-	fp := fingerprintHash(cfg.Hostname + "\x00" + token)
-	cacheKey := fp + ":pat:" + defaultCacheKey
+	cacheKey := patTokenCacheKey(cfg.Hostname, token)
+
+	minValidFor := req.MinValidFor
+	if minValidFor == 0 {
+		minValidFor = auth.DefaultMinValidFor
+	}
 
 	// Check cache unless force refresh
 	if !req.ForceRefresh && hostClient != nil {
-		cached, err := cacheGet(ctx, hostClient, cacheKey, profile)
-		if err == nil && cached != nil && subtle.ConstantTimeCompare([]byte(cached.AccessToken), []byte(token)) == 1 {
-			minValidFor := req.MinValidFor
-			if minValidFor == 0 {
-				minValidFor = auth.DefaultMinValidFor
-			}
-			if cached.IsValidFor(minValidFor) {
-				return &sdkplugin.TokenResponse{
-					AccessToken: cached.AccessToken,
-					TokenType:   cached.TokenType,
-					ExpiresAt:   cached.ExpiresAt,
-					Scope:       cached.Scope,
-					Flow:        cached.Flow,
-					SessionID:   cached.SessionID,
-				}, nil
-			}
+		cached, cErr := cacheGet(ctx, hostClient, cacheKey, profile)
+		if cErr == nil && cached != nil &&
+			subtle.ConstantTimeCompare([]byte(cached.AccessToken), []byte(token)) == 1 &&
+			cached.IsValidFor(minValidFor) {
+			return &sdkplugin.TokenResponse{
+				AccessToken: cached.AccessToken,
+				TokenType:   cached.TokenType,
+				ExpiresAt:   cached.ExpiresAt,
+				Scope:       cached.Scope,
+				Flow:        cached.Flow,
+				SessionID:   cached.SessionID,
+			}, nil
+		}
+	}
+
+	releaseSlot, slotErr := p.acquireRefreshSlot(ctx, "pat:"+profile)
+	if slotErr != nil {
+		return nil, slotErr
+	}
+	defer releaseSlot()
+
+	if !req.ForceRefresh && hostClient != nil {
+		cached, cErr := cacheGet(ctx, hostClient, cacheKey, profile)
+		if cErr == nil && cached != nil &&
+			subtle.ConstantTimeCompare([]byte(cached.AccessToken), []byte(token)) == 1 &&
+			cached.IsValidFor(minValidFor) {
+			return &sdkplugin.TokenResponse{
+				AccessToken: cached.AccessToken,
+				TokenType:   cached.TokenType,
+				ExpiresAt:   cached.ExpiresAt,
+				Scope:       cached.Scope,
+				Flow:        cached.Flow,
+				SessionID:   cached.SessionID,
+			}, nil
 		}
 	}
 
 	// Validate the PAT
 	if _, err := p.fetchUserClaims(ctx, token); err != nil {
-		return nil, fmt.Errorf("PAT validation failed: %w", err)
+		var cleanupErr error
+		if isUnauthorizedStatusError(err) && hostClient != nil {
+			cleanupErr = p.evictRejectedAmbientPAT(ctx, hostClient, cfg, profile, cacheKey, token)
+		}
+		valErr := fmt.Errorf("PAT validation failed: %w", err)
+		if cleanupErr != nil {
+			return nil, errors.Join(valErr, cleanupErr)
+		}
+		return nil, valErr
 	}
 
 	result := &sdkplugin.TokenResponse{
@@ -165,7 +237,7 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 		Flow:        auth.FlowPAT,
 	}
 
-	// Cache it
+	// Cache it while holding the profile's PAT slot.
 	if hostClient != nil {
 		cacheToken := &auth.Token{
 			AccessToken: token,
@@ -180,4 +252,87 @@ func (p *Plugin) getPATToken(ctx context.Context, req sdkplugin.TokenRequest) (*
 	}
 
 	return result, nil
+}
+
+func (p *Plugin) evictRejectedAmbientPAT(
+	ctx context.Context,
+	hostClient *sdkplugin.HostServiceClient,
+	cfg *Config,
+	profile, cacheKey, token string,
+) error {
+	cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
+	defer cleanupCancel()
+	cleanupCtx = auth.WithProfile(cleanupCtx, profile)
+
+	mu := p.profileLock(profile)
+	mu.Lock()
+	defer mu.Unlock()
+
+	var errs []error
+	const maxHostSecretKeyBytes = 255
+	if prefix, pErr := profileTokenPrefix(profile); pErr == nil {
+		fullKey := prefix + cacheKey
+		if len(fullKey) <= maxHostSecretKeyBytes && isProfileTokenCacheSecret(fullKey, prefix, profile) && sdkplugin.ValidateHostSecretName(fullKey) == nil {
+			if _, found, getErr := hostClient.GetSecret(cleanupCtx, fullKey); getErr != nil || found {
+				if delErr := hostClient.DeleteSecret(cleanupCtx, fullKey); delErr != nil {
+					errs = append(errs, fmt.Errorf("evicting rejected PAT cache entry: %w", delErr))
+				} else if getErr != nil {
+					errs = append(errs, fmt.Errorf("checking rejected PAT cache entry: %w", getErr))
+				}
+			}
+		}
+	}
+
+	refreshKey, _ := profileSecretKey(SecretKeyRefreshToken, profile)
+	accessKey, _ := profileSecretKey(SecretKeyAccessToken, profile)
+	metaKey, _ := profileSecretKey(SecretKeyMetadata, profile)
+
+	curRefresh, curRefFound, curRefErr := hostClient.GetSecret(cleanupCtx, refreshKey)
+	if curRefErr != nil {
+		errs = append(errs, fmt.Errorf("checking refresh token during PAT cleanup: %w", curRefErr))
+		return errors.Join(errs...)
+	}
+	if curRefFound && curRefresh != "" {
+		return errors.Join(errs...)
+	}
+
+	curAccess, curFound, curErr := hostClient.GetSecret(cleanupCtx, accessKey)
+	if curErr != nil {
+		errs = append(errs, fmt.Errorf("checking stored access token during PAT cleanup: %w", curErr))
+		return errors.Join(errs...)
+	}
+	if !curFound || subtle.ConstantTimeCompare([]byte(curAccess), []byte(token)) != 1 {
+		return errors.Join(errs...)
+	}
+
+	curMetaRaw, curMetaFound, curMetaErr := hostClient.GetSecret(cleanupCtx, metaKey)
+	if curMetaErr != nil {
+		errs = append(errs, fmt.Errorf("checking session metadata during PAT cleanup: %w", curMetaErr))
+		return errors.Join(errs...)
+	}
+	var metadata *TokenMetadata
+	if curMetaFound {
+		var parsed TokenMetadata
+		if uErr := decodeMetadata(curMetaRaw, &parsed); uErr != nil {
+			errs = append(errs, fmt.Errorf("decoding session metadata during PAT cleanup: %w", uErr))
+			return errors.Join(errs...)
+		}
+		metadata = &parsed
+	}
+	sessionCfg, hostErr := resolveSessionConfig(cfg, metadata)
+	if hostErr != nil || !strings.EqualFold(sessionCfg.Hostname, cfg.Hostname) {
+		return errors.Join(errs...)
+	}
+
+	if clearErr := cacheClearErr(cleanupCtx, hostClient, profile); clearErr != nil {
+		errs = append(errs, fmt.Errorf("clearing rejected token cache: %w", clearErr))
+	}
+	if delErr := hostClient.DeleteSecret(cleanupCtx, accessKey); delErr != nil {
+		errs = append(errs, fmt.Errorf("deleting rejected access token: %w", delErr))
+	} else if curMetaFound {
+		if metaDelErr := hostClient.DeleteSecret(cleanupCtx, metaKey); metaDelErr != nil {
+			errs = append(errs, fmt.Errorf("deleting rejected session metadata: %w", metaDelErr))
+		}
+	}
+	return errors.Join(errs...)
 }

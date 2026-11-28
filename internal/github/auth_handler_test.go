@@ -90,7 +90,8 @@ func TestLogin(t *testing.T) {
 			Name:  "The Octocat",
 			Email: "octocat@github.com",
 		})
-		p := newTestPlugin(mock)
+		fake := newFakeHostService()
+		p := newTestPluginWithHost(mock, fake)
 		t.Setenv(EnvGitHubToken, "ghp_testtoken123")
 
 		resp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
@@ -100,6 +101,46 @@ func TestLogin(t *testing.T) {
 		assert.NotNil(t, resp.Claims)
 		assert.Equal(t, "octocat", resp.Claims.Subject)
 		assert.Equal(t, "The Octocat", resp.Claims.Name)
+
+		storedAT, err := p.loadAccessToken(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "ghp_testtoken123", storedAT)
+
+		meta, err := p.loadMetadata(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, auth.FlowPAT, meta.Flow)
+	})
+
+	t.Run("pat flow without host secret store fails closed", func(t *testing.T) {
+		mock := NewMockHTTPClient()
+		p := newTestPlugin(mock)
+		t.Setenv(EnvGitHubToken, "ghp_testtoken123")
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowPAT,
+		}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "host secret store is not available")
+		assert.NotContains(t, err.Error(), "ghp_testtoken123")
+		assert.Empty(t, mock.GetRequests())
+	})
+
+	t.Run("pat flow with invalid token does not persist secrets", func(t *testing.T) {
+		mock := NewMockHTTPClient()
+		mock.AddResponse(401, map[string]string{"message": "Bad credentials"})
+		fake := newFakeHostService()
+		p := newTestPluginWithHost(mock, fake)
+		t.Setenv(EnvGitHubToken, "ghp_invalid_token_401")
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowPAT,
+		}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "PAT authentication failed")
+		assert.NotContains(t, err.Error(), "ghp_invalid_token_401")
+		fake.mu.Lock()
+		assert.Empty(t, fake.secrets)
+		fake.mu.Unlock()
 	})
 }
 
@@ -230,19 +271,25 @@ func TestDetectAvailableFlows(t *testing.T) {
 
 		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
 		require.NoError(t, err)
-		require.NotEmpty(t, flows)
+		require.Len(t, flows, 4)
 
+		assert.Equal(t, auth.FlowPAT, flows[0].Flow)
+		assert.False(t, flows[0].Available)
+		assert.Equal(t, auth.FlowGitHubApp, flows[1].Flow)
+		assert.False(t, flows[1].Available)
+		assert.Equal(t, auth.FlowInteractive, flows[2].Flow)
+		assert.True(t, flows[2].Available)
+		assert.Equal(t, auth.FlowDeviceCode, flows[3].Flow)
+		assert.True(t, flows[3].Available)
+
+		var firstAvailable auth.Flow
 		for _, f := range flows {
-			if f.Flow == auth.FlowPAT {
-				assert.False(t, f.Available)
-			}
-			if f.Flow == auth.FlowDeviceCode {
-				assert.True(t, f.Available)
-			}
-			if f.Flow == auth.FlowInteractive {
-				assert.True(t, f.Available)
+			if f.Available {
+				firstAvailable = f.Flow
+				break
 			}
 		}
+		assert.Equal(t, auth.FlowInteractive, firstAvailable)
 	})
 
 	t.Run("pat env set", func(t *testing.T) {

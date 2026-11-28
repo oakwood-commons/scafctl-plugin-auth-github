@@ -1144,7 +1144,7 @@ func TestPerRPCRequestSettingsAndProfileIsolation(t *testing.T) {
 
 		mock := NewMockHTTPClient()
 		mock.AddResponse(http.StatusOK, User{Login: "ghes-pat-user", ID: 12})
-		p := newTestPlugin(mock)
+		p := newTestPluginWithHost(mock, newFakeHostService())
 
 		resp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
 			Flow:     auth.FlowPAT,
@@ -2593,7 +2593,7 @@ func TestSecurityAndSessionParityRegressions(t *testing.T) {
 		clearGitHubCredentialEnv(t)
 
 		fake := newFakeHostService()
-		p := newTestPluginWithHost(nil, fake)
+		p := newTestPluginWithHost(NewMockHTTPClient(), fake)
 
 		_, err := p.storeCredentials(context.Background(), &TokenResponse{
 			AccessToken: "old_at", RefreshToken: "consumed_old_rt", TokenType: "bearer", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400,
@@ -2735,7 +2735,7 @@ func TestSecurityAndSessionParityRegressions(t *testing.T) {
 		clearGitHubCredentialEnv(t)
 
 		fake := newFakeHostService()
-		p := newTestPluginWithHost(nil, fake)
+		p := newTestPluginWithHost(NewMockHTTPClient(), fake)
 
 		_, err := p.storeCredentials(context.Background(), &TokenResponse{
 			AccessToken: "seed_at", RefreshToken: "seed_rt", TokenType: "bearer", ExpiresIn: 3600, RefreshTokenExpiresIn: 86400,

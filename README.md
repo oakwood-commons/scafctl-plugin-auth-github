@@ -37,6 +37,12 @@ the **github** auth handler:
 # or device code with automatic browser launch otherwise)
 scafctl auth login github
 
+# Headless device-code login without opening a browser
+scafctl auth login github --flow device-code
+
+# Validate and persist a personal access token for the active profile
+GH_TOKEN="$TOKEN" scafctl auth login github --flow pat
+
 # Open a specific browser (or set $BROWSER as a fallback)
 scafctl auth login github --flow interactive --browser msedge
 

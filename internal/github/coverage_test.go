@@ -206,8 +206,7 @@ func TestStoreCredentials_CachesTokenMetadata(t *testing.T) {
 			_, err := p.storeCredentials(ctx, tc.tokenResp, requestedScopes, "sess-xyz", tc.flow)
 			require.NoError(t, err)
 
-			fp := fingerprintHash(p.config.Hostname)
-			cached, err := cacheGet(ctx, hc, fp+":"+defaultCacheKey, "")
+			cached, err := cacheGet(ctx, hc, sessionTokenCacheKey(p.config.Hostname), "")
 			require.NoError(t, err)
 			require.NotNil(t, cached, "expected a cache entry to be created")
 
@@ -1128,7 +1127,8 @@ func TestLogin_EmptyFlowWithClientSecret(t *testing.T) {
 func TestLogin_ImplicitPATDetection(t *testing.T) {
 	mock := NewMockHTTPClient()
 	mock.AddResponse(200, User{Login: "auto_pat", ID: 55, Name: "Auto PAT"})
-	p := newTestPlugin(mock)
+	fake := newFakeHostService()
+	p := newTestPluginWithHost(mock, fake)
 	t.Setenv(EnvGitHubToken, "ghp_auto_detect")
 	t.Setenv(EnvGHToken, "")
 

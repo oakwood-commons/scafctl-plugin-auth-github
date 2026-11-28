@@ -1,6 +1,7 @@
 package clock
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -107,4 +108,27 @@ drained:
 	default:
 		t.Fatal("Send should have delivered a value")
 	}
+}
+
+func TestRealSleep(t *testing.T) {
+	r := Real{}
+
+	require.NoError(t, r.Sleep(context.Background(), 0))
+	require.NoError(t, r.Sleep(context.Background(), 5*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err := r.Sleep(ctx, time.Hour)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+func TestMockSleep(t *testing.T) {
+	m := Mock{}
+	require.NoError(t, m.Sleep(context.Background(), 10*time.Second))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, m.Sleep(ctx, 10*time.Second), context.Canceled)
 }
